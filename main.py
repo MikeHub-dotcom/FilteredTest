@@ -139,6 +139,165 @@ class Config:
     grad_clip: float = 1.0
 
 
+def sample_trial_cfg(base: Config, rng: np.random.Generator) -> Config:
+    """
+    Professionell gewählter, kompakter Suchraum: fokus auf signalrelevante Parameter.
+    - horizon/lookback/theta dominieren Signal/Noise + Trade-Frequenz
+    - lr/wd/dropout stabilisieren Generalisierung
+    """
+    cfg = Config(**asdict(base))
+
+    # Signal / trade-frequency drivers
+    cfg.horizon = int(rng.choice([3, 5, 10]))
+    cfg.lookback = int(rng.choice([64, 96, 128]))
+    cfg.ignore_band_logret = float(rng.choice([0.010, 0.015, 0.020]))
+
+    # Conservative cost robustness (optional but recommended)
+    cfg.roundtrip_cost_bps = float(rng.choice([20.0, 35.0, 50.0]))
+
+    # Optimization / regularization
+    cfg.lr = float(rng.choice([3e-4, 5e-4, 8e-4]))
+    cfg.weight_decay = float(rng.choice([1e-5, 1e-4, 5e-4]))
+    cfg.dropout = float(rng.choice([0.05, 0.10, 0.20]))
+
+    # Keep stable
+    cfg.batch_size = int(rng.choice([512, 768, 1024]))  # 4090 typically ok; adjust if OOM
+    cfg.grad_clip = float(rng.choice([0.5, 1.0, 2.0]))
+    cfg.threshold_grid = 81
+    cfg.min_trades_val = 200  # Screening: avoids "1 lucky trade" winners
+
+    # Sweep speed (screening)
+    cfg.epochs = 2  # overwritten by args.sweep_epochs at runtime
+    cfg.max_anchors_train = int(rng.choice([800_000, 1_200_000, 1_500_000]))
+    cfg.max_anchors_val = int(rng.choice([300_000, 450_000, 600_000]))
+
+    return cfg
+
+
+def make_trial_outdir(base_outdir: str, trial_id: int) -> str:
+    d = os.path.join(base_outdir, f"trial_{trial_id:04d}")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def write_jsonl(path: str, row: dict) -> None:
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(row) + "\n")
+
+
+def run_single_training(
+    cfg: Config,
+    args,
+    X: np.ndarray,
+    M: np.ndarray,
+    assets: List[str],
+    dates: List[str],
+    feat_names: List[str],
+    close_idx: int,
+    splits: Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]],
+    outdir: str,
+) -> Dict[str, float]:
+    """
+    Runs train/val for cfg.epochs and returns val profit metrics + classifier metrics.
+    Uses subsampling via cfg.max_anchors_* for sweep speed.
+    """
+    logger = setup_logger(outdir)
+    logger.info(f"device={cfg.device}")
+    set_seed(int(cfg.seed_trials))
+    torch.backends.cudnn.benchmark = bool(cfg.cudnn_benchmark)
+    scaler = torch.cuda.amp.GradScaler(enabled=(cfg.amp and cfg.device.startswith("cuda")))
+
+    (tr_s, tr_e), (va_s, va_e), (te_s, te_e) = splits
+    A, T, F = X.shape
+
+    close_raw = X[:, :, close_idx].copy()
+
+    # leakage-free standardization (train window only)
+    X_train = X[:, tr_s:tr_e + 1, :]
+    M_train = M[:, tr_s:tr_e + 1, :]
+    mu, sig = masked_mean_std(X_train, M_train)
+    Xn = apply_masked_standardize(X, M, mu, sig)
+
+    asset_keep = build_asset_filter_from_masks(M, close_idx=close_idx)
+
+    train_ds = CubeProfitDataset(
+        X=Xn, M=M, close_idx=close_idx,
+        t_start=tr_s, t_end=tr_e,
+        lookback=cfg.lookback, horizon=cfg.horizon,
+        roundtrip_cost_bps=cfg.roundtrip_cost_bps,
+        asset_filter=asset_keep,
+        require_close_obs=True,
+        close_raw=close_raw,
+        theta=cfg.ignore_band_logret,
+        max_anchors=cfg.max_anchors_train,
+        seed=cfg.seed_trials,
+    )
+    val_ds = CubeProfitDataset(
+        X=Xn, M=M, close_idx=close_idx,
+        t_start=va_s, t_end=va_e,
+        lookback=cfg.lookback, horizon=cfg.horizon,
+        roundtrip_cost_bps=cfg.roundtrip_cost_bps,
+        asset_filter=asset_keep,
+        require_close_obs=True,
+        close_raw=close_raw,
+        theta=cfg.ignore_band_logret,
+        max_anchors=cfg.max_anchors_val,
+        seed=cfg.seed_trials + 1,
+    )
+
+    pin = (cfg.device == "cuda")
+    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True,
+                              num_workers=cfg.num_workers, pin_memory=pin)
+    val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False,
+                            num_workers=cfg.num_workers, pin_memory=pin)
+
+    model = ConvNet1D(in_ch=2 * F, dropout=cfg.dropout).to(cfg.device)
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.epochs)
+
+    best_val_avg_rnet = -float("inf")
+    best_thr = 0.5
+    best_info = {"trades": 0, "avg_rnet": float("nan"), "winrate": float("nan")}
+    best_val_bce = float("nan")
+    best_val_acc = float("nan")
+
+    for epoch in range(1, cfg.epochs + 1):
+        tr_loss = train_one_epoch(
+            model=model, loader=train_loader, opt=opt, device=cfg.device,
+            logger=logger, epoch=epoch, scaler=scaler, amp=cfg.amp,
+            grad_clip=cfg.grad_clip, log_every=200
+        )
+        val_metrics = evaluate_classifier(model, val_loader, cfg.device)
+
+        thresholds = np.linspace(0.50, 0.90, cfg.threshold_grid, dtype=np.float32)
+        val_thr, val_info = threshold_search_for_profitability(
+            model=model, dataset=val_ds, device=cfg.device,
+            thresholds=thresholds, min_trades=cfg.min_trades_val
+        )
+
+        val_trades = int(val_info.get("trades", 0))
+        val_avg_rnet = float(val_info.get("avg_rnet", float("nan")))
+
+        if np.isfinite(val_avg_rnet) and val_trades >= cfg.min_trades_val and val_avg_rnet > best_val_avg_rnet:
+            best_val_avg_rnet = val_avg_rnet
+            best_thr = float(val_thr)
+            best_info = dict(val_info)
+            best_val_bce = float(val_metrics["bce"])
+            best_val_acc = float(val_metrics["acc@0.5"])
+
+        sched.step()
+
+    return {
+        "best_val_avg_rnet": float(best_val_avg_rnet),
+        "best_val_thr": float(best_thr),
+        "best_val_trades": int(best_info.get("trades", 0)),
+        "best_val_winrate": float(best_info.get("winrate", float("nan"))),
+        "best_val_score": float(best_info.get("score", float("nan"))),
+        "best_val_bce": float(best_val_bce),
+        "best_val_acc": float(best_val_acc),
+    }
+
+
 # ----------------------------
 # Dataset: pooled cross-asset samples
 # ----------------------------
@@ -595,6 +754,14 @@ def main():
                     help="Optional: evaluate/focus on single asset name (must exist in assets list)")
     ap.add_argument("--train_frac", type=float, default=0.70)
     ap.add_argument("--val_frac", type=float, default=0.15)
+    # ----------------------------
+    # Sweep arguments
+    # ----------------------------
+    ap.add_argument("--sweep", action="store_true", help="Run hyperparameter sweep (screening mode)")
+    ap.add_argument("--trials", type=int, default=48, help="Number of sweep trials")
+    ap.add_argument("--sweep_epochs", type=int, default=2, help="Epochs per trial during sweep screening")
+    ap.add_argument("--sweep_seed", type=int, default=1234, help="Base RNG seed for sweep sampling")
+
     args = ap.parse_args()
 
     cfg = Config()
@@ -625,6 +792,88 @@ def main():
             break
     if close_idx is None:
         raise RuntimeError("Could not find 'Close' feature in features json.")
+
+    # ----------------------------
+    # SWEEP MODE (screening + optional refit)
+    # ----------------------------
+    if args.sweep:
+        base_cfg = Config()
+        base_cfg.device = cfg.device  # keep detected device
+        base_cfg.num_workers = cfg.num_workers
+        base_cfg.amp = cfg.amp
+        base_cfg.cudnn_benchmark = cfg.cudnn_benchmark
+
+        rng = np.random.default_rng(args.sweep_seed)
+
+        (tr_s, tr_e), (va_s, va_e), (te_s, te_e) = time_split_indices(T, args.train_frac, args.val_frac)
+        splits = ((tr_s, tr_e), (va_s, va_e), (te_s, te_e))
+
+        sweep_outdir = os.path.join(args.outdir, "sweep")
+        os.makedirs(sweep_outdir, exist_ok=True)
+        results_path = os.path.join(sweep_outdir, "results.jsonl")
+
+        safe_log(f"[INFO] SWEEP start: trials={args.trials} sweep_epochs={args.sweep_epochs} out={sweep_outdir}")
+
+        leaderboard = []
+
+        for trial in range(1, args.trials + 1):
+            trial_cfg = sample_trial_cfg(base_cfg, rng)
+            trial_cfg.epochs = int(args.sweep_epochs)
+            trial_cfg.seed_trials = int(args.sweep_seed + trial)
+            trial_cfg.seed = trial_cfg.seed_trials
+
+            tdir = make_trial_outdir(sweep_outdir, trial)
+
+            # log config for reproducibility
+            with open(os.path.join(tdir, "cfg.json"), "w", encoding="utf-8") as f:
+                json.dump(asdict(trial_cfg), f, indent=2)
+
+            # run
+            t0 = time.time()
+            metrics = run_single_training(
+                cfg=trial_cfg, args=args, X=X, M=M,
+                assets=assets, dates=dates, feat_names=feat_names,
+                close_idx=close_idx, splits=splits, outdir=tdir
+            )
+            dt = time.time() - t0
+
+            row = {
+                "trial": trial,
+                "time_s": round(dt, 2),
+                **asdict(trial_cfg),
+                **metrics,
+            }
+            write_jsonl(results_path, row)
+
+            leaderboard.append(row)
+
+            safe_log(
+                f"[SWEEP] trial={trial:04d} "
+                f"avg_rnet={metrics['best_val_avg_rnet']:.6f} trades={metrics['best_val_trades']} "
+                f"thr={metrics['best_val_thr']:.3f} "
+                f"L={trial_cfg.lookback} H={trial_cfg.horizon} theta={trial_cfg.ignore_band_logret:.3f} "
+                f"lr={trial_cfg.lr:.1e} wd={trial_cfg.weight_decay:.1e} do={trial_cfg.dropout:.2f} "
+                f"cost={trial_cfg.roundtrip_cost_bps:.0f}bps time={dt:.1f}s"
+            )
+
+        # sort by best_val_avg_rnet then trades
+        leaderboard.sort(key=lambda r: (r["best_val_avg_rnet"], r["best_val_trades"]), reverse=True)
+
+        top_path = os.path.join(sweep_outdir, "leaderboard_top.csv")
+        with open(top_path, "w", encoding="utf-8") as f:
+            cols = [
+                "trial", "best_val_avg_rnet", "best_val_trades", "best_val_thr", "best_val_winrate",
+                "lookback", "horizon", "ignore_band_logret", "lr", "weight_decay", "dropout",
+                "roundtrip_cost_bps", "batch_size", "max_anchors_train", "max_anchors_val",
+                "best_val_bce", "best_val_acc", "time_s"
+            ]
+            f.write(",".join(cols) + "\n")
+            for r in leaderboard[:50]:
+                f.write(",".join(str(r.get(c, "")) for c in cols) + "\n")
+
+        safe_log(f"[INFO] SWEEP done. Top list written: {top_path}")
+        safe_log("[DONE]")
+        return
 
     # Time splits (inclusive indices for anchor t)
     (tr_s, tr_e), (va_s, va_e), (te_s, te_e) = time_split_indices(T, args.train_frac, args.val_frac)
@@ -750,6 +999,26 @@ def main():
             f"[VAL] thr={val_thr:.3f} trades={val_trades} "
             f"avg_rnet={val_avg_rnet:.6f} winrate={val_winrate:.3f}"
         )
+
+        # append trial row (epoch-level)
+        row = {
+            "epoch": epoch,
+            "lookback": cfg.lookback,
+            "horizon": cfg.horizon,
+            "theta": cfg.ignore_band_logret,
+            "lr": cfg.lr,
+            "wd": cfg.weight_decay,
+            "dropout": cfg.dropout,
+            "cost_bps": cfg.roundtrip_cost_bps,
+            "val_thr": val_thr,
+            "val_trades": val_trades,
+            "val_avg_rnet": val_avg_rnet,
+            "val_winrate": val_winrate,
+            "val_bce": val_metrics["bce"],
+            "val_acc": val_metrics["acc@0.5"],
+        }
+        with open(os.path.join(args.outdir, "metrics.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps(row) + "\n")
 
         ep_time = time.time() - ep_t0
         logger.info(
