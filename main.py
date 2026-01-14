@@ -118,13 +118,14 @@ class Config:
     num_workers: int = 0
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     seed: int = 42
+    ignore_band_logret: float = 0.006  # z.B. 0.3% log-return nach Kosten; 0.0 = deaktiviert
 
     # Cost model (very important for "profit probability")
     # roundtrip_cost_bps ~ commissions+spread+slippage (rough)
     roundtrip_cost_bps: float = 20.0  # 20 bps = 0.20% roundtrip
 
     # Validation threshold search
-    min_trades_val: int = 200
+    min_trades_val: int = 100
     threshold_grid: int = 51  # number of thresholds between 0.5..0.9
 
 
@@ -149,6 +150,7 @@ class CubeProfitDataset(Dataset):
             horizon: int,
             roundtrip_cost_bps: float,
             close_raw: np.ndarray,  # (A,T)
+            theta: float = 0.0,
             asset_filter: Optional[np.ndarray] = None,  # (A,) bool
             require_close_obs: bool = True,
     ):
@@ -165,6 +167,7 @@ class CubeProfitDataset(Dataset):
         self.F = F
         self.close_idx = close_idx
         self.close_raw = close_raw
+        self.theta = float(theta)
 
         self.t_start = t_start
         self.t_end = t_end
@@ -232,11 +235,25 @@ class CubeProfitDataset(Dataset):
             y = 0.0
             valid = 0.0
         else:
-            r = math.log(c1 / c0)  # log-return
-            # apply roundtrip cost once per trade (Long/Flat)
+            r = math.log(c1 / c0)
             r_net = r - self.cost
-            y = 1.0 if (r_net > 0.0) else 0.0
-            valid = 1.0
+
+            theta = self.theta
+            if theta > 0.0:
+                if r_net > theta:
+                    y = 1.0
+                    valid = 1.0
+                elif r_net < -theta:
+                    y = 0.0
+                    valid = 1.0
+                else:
+                    # Ignore-zone: zu kleine Bewegung => kein Trainingssignal
+                    y = 0.0
+                    valid = 0.0
+            else:
+                # Fallback: altes Verhalten (profit > 0)
+                y = 1.0 if (r_net > 0.0) else 0.0
+                valid = 1.0
 
         # Return as tensors; CNN expects [C,L]
         x_t = torch.from_numpy(x_cat.T).float()  # (2F, L)
@@ -441,6 +458,7 @@ def train_one_epoch(
             # label balance in this batch (valid only)
             with torch.no_grad():
                 vb = (v > 0.5).squeeze(1)
+                valid_rate = float(vb.float().mean().detach().cpu().item())
                 if vb.any():
                     y_mean = float(y[vb].mean().detach().cpu().item())
                 else:
@@ -448,7 +466,7 @@ def train_one_epoch(
             logger.info(
                 f"E{epoch:03d} S{step:05d}/{len(loader):05d} "
                 f"loss={loss_val:.6f} ema={ema:.6f} y_mean={y_mean:.3f} "
-                f"lr={lr:.3e} step/s={step_s:.2f}"
+                f"lr={lr:.3e} step/s={step_s:.2f}, valid_rate={valid_rate:.3f}"
             )
 
     return float(np.mean(losses)) if losses else float("nan")
@@ -598,7 +616,8 @@ def main():
         roundtrip_cost_bps=cfg.roundtrip_cost_bps,
         asset_filter=asset_keep,
         require_close_obs=True,
-        close_raw=close_raw
+        close_raw=close_raw,
+        theta=cfg.ignore_band_logret
     )
     val_ds = CubeProfitDataset(
         X=X, M=M, close_idx=close_idx,
@@ -607,7 +626,8 @@ def main():
         roundtrip_cost_bps=cfg.roundtrip_cost_bps,
         asset_filter=asset_keep,
         require_close_obs=True,
-        close_raw=close_raw
+        close_raw=close_raw,
+        theta=cfg.ignore_band_logret
     )
     test_ds = CubeProfitDataset(
         X=X, M=M, close_idx=close_idx,
@@ -616,7 +636,8 @@ def main():
         roundtrip_cost_bps=cfg.roundtrip_cost_bps,
         asset_filter=asset_keep,
         require_close_obs=True,
-        close_raw=close_raw
+        close_raw=close_raw,
+        theta=cfg.ignore_band_logret
     )
 
     safe_log(f"[INFO] samples: train={len(train_ds)} val={len(val_ds)} test={len(test_ds)}")
