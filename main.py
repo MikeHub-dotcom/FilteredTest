@@ -128,6 +128,16 @@ class Config:
     min_trades_val: int = 100
     threshold_grid: int = 81  # number of thresholds between 0.5..0.9
 
+    # Fast sweep / screening
+    max_anchors_train: int = 1_500_000  # set 0 to disable
+    max_anchors_val: int = 600_000  # set 0 to disable
+    seed_trials: int = 123
+
+    # GPU speed-ups
+    amp: bool = True
+    cudnn_benchmark: bool = True
+    grad_clip: float = 1.0
+
 
 # ----------------------------
 # Dataset: pooled cross-asset samples
@@ -153,6 +163,8 @@ class CubeProfitDataset(Dataset):
             theta: float = 0.0,
             asset_filter: Optional[np.ndarray] = None,  # (A,) bool
             require_close_obs: bool = True,
+            max_anchors: int = 0,
+            seed: int = 0,
     ):
         super().__init__()
         assert X.ndim == 3 and M.ndim == 3
@@ -168,6 +180,8 @@ class CubeProfitDataset(Dataset):
         self.close_idx = close_idx
         self.close_raw = close_raw
         self.theta = float(theta)
+        self.max_anchors = int(max_anchors)
+        self.seed = int(seed)
 
         self.t_start = t_start
         self.t_end = t_end
@@ -201,11 +215,12 @@ class CubeProfitDataset(Dataset):
                 if require_close_obs:
                     if close_mask[a, t] == 0 or close_mask[a, t + horizon] == 0:
                         continue
-                # Apply ignore band already in anchor construction (so we don't train on ignored samples) ---
+
+                # --- NEW: ignore-band filtering at anchor-build time (fast) ---
                 if self.theta > 0.0:
                     c0 = float(self.close_raw[a, t])
                     c1 = float(self.close_raw[a, t + horizon])
-                    if c0 <= 0 or c1 <= 0:
+                    if c0 <= 0.0 or c1 <= 0.0:
                         continue
                     r_net = math.log(c1 / c0) - self.cost
                     if not (r_net > self.theta or r_net < -self.theta):
@@ -214,6 +229,12 @@ class CubeProfitDataset(Dataset):
                 anchors.append((a, t))
 
         self.anchors = anchors
+
+        # --- NEW: optional anchor subsampling for fast sweeps ---
+        if self.max_anchors > 0 and len(self.anchors) > self.max_anchors:
+            rng = np.random.default_rng(self.seed)
+            idx = rng.choice(len(self.anchors), size=self.max_anchors, replace=False)
+            self.anchors = [self.anchors[i] for i in idx]
 
         # Small sanity check
         if len(self.anchors) == 0:
@@ -431,6 +452,9 @@ def train_one_epoch(
         device: str,
         logger: logging.Logger,
         epoch: int,
+        scaler: Optional[torch.cuda.amp.GradScaler],
+        amp: bool,
+        grad_clip: float,
         log_every: int = 100,  # <<< statt 1
 ) -> float:
     model.train()
@@ -447,15 +471,27 @@ def train_one_epoch(
         v = v.to(device, non_blocking=True)
 
         opt.zero_grad(set_to_none=True)
-        logit = model(x)
-        logit = torch.clamp(logit, -10.0, 10.0)  # stabilizes BCE under noisy labels
 
-        loss_raw = loss_fn(logit, y)
-        loss = (loss_raw * v).sum() / (v.sum() + 1e-9)
+        use_amp = bool(amp and device.startswith("cuda") and scaler is not None)
 
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            logit = model(x)
+            logit = torch.clamp(logit, -10.0, 10.0)
+            loss_raw = loss_fn(logit, y)
+            loss = (loss_raw * v).sum() / (v.sum() + 1e-9)
+
+        if use_amp:
+            scaler.scale(loss).backward()
+            if grad_clip and grad_clip > 0:
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            scaler.step(opt)
+            scaler.update()
+        else:
+            loss.backward()
+            if grad_clip and grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            opt.step()
 
         loss_val = float(loss.detach().cpu().item())
         losses.append(loss_val)
@@ -568,6 +604,9 @@ def main():
     logger = setup_logger(args.outdir)
     logger.info(f"device={cfg.device}")
 
+    torch.backends.cudnn.benchmark = bool(cfg.cudnn_benchmark)
+    scaler = torch.cuda.amp.GradScaler(enabled=(cfg.amp and cfg.device.startswith("cuda")))
+
     X = np.load(args.dataset)  # (A,T,F) float32
     M = np.load(args.mask)  # (A,T,F) uint8
     assets = load_text_lines(args.assets)
@@ -626,7 +665,9 @@ def main():
         asset_filter=asset_keep,
         require_close_obs=True,
         close_raw=close_raw,
-        theta=cfg.ignore_band_logret
+        theta=cfg.ignore_band_logret,
+        max_anchors=cfg.max_anchors_train,
+        seed=cfg.seed_trials,
     )
     val_ds = CubeProfitDataset(
         X=X, M=M, close_idx=close_idx,
@@ -636,7 +677,9 @@ def main():
         asset_filter=asset_keep,
         require_close_obs=True,
         close_raw=close_raw,
-        theta=cfg.ignore_band_logret
+        theta=cfg.ignore_band_logret,
+        max_anchors=cfg.max_anchors_val,
+        seed=cfg.seed_trials + 1,
     )
     test_ds = CubeProfitDataset(
         X=X, M=M, close_idx=close_idx,
@@ -646,7 +689,9 @@ def main():
         asset_filter=asset_keep,
         require_close_obs=True,
         close_raw=close_raw,
-        theta=cfg.ignore_band_logret
+        theta=cfg.ignore_band_logret,
+        max_anchors=0,
+        seed=cfg.seed_trials + 2,
     )
 
     safe_log(f"[INFO] samples: train={len(train_ds)} val={len(val_ds)} test={len(test_ds)}")
@@ -679,6 +724,9 @@ def main():
             device=cfg.device,
             logger=logger,
             epoch=epoch,
+            scaler=scaler,
+            amp=cfg.amp,
+            grad_clip=cfg.grad_clip,
             log_every=100,
         )
 
