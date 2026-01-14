@@ -26,7 +26,7 @@ import math
 import os
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 
@@ -118,7 +118,7 @@ class Config:
     num_workers: int = 0
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     seed: int = 42
-    ignore_band_logret: float = 0.006  # z.B. 0.3% log-return nach Kosten; 0.0 = deaktiviert
+    ignore_band_logret: float = 0.015  # 0.0 = deaktiviert
 
     # Cost model (very important for "profit probability")
     # roundtrip_cost_bps ~ commissions+spread+slippage (rough)
@@ -126,7 +126,7 @@ class Config:
 
     # Validation threshold search
     min_trades_val: int = 100
-    threshold_grid: int = 51  # number of thresholds between 0.5..0.9
+    threshold_grid: int = 81  # number of thresholds between 0.5..0.9
 
 
 # ----------------------------
@@ -470,7 +470,6 @@ def train_one_epoch(
             # label balance in this batch (valid only)
             with torch.no_grad():
                 vb = (v > 0.5).squeeze(1)
-                valid_rate = float(vb.float().mean().detach().cpu().item())
                 if vb.any():
                     y_mean = float(y[vb].mean().detach().cpu().item())
                 else:
@@ -478,7 +477,7 @@ def train_one_epoch(
             logger.info(
                 f"E{epoch:03d} S{step:05d}/{len(loader):05d} "
                 f"loss={loss_val:.6f} ema={ema:.6f} y_mean={y_mean:.3f} "
-                f"lr={lr:.3e} step/s={step_s:.2f}, valid_rate={valid_rate:.3f}"
+                f"lr={lr:.3e} step/s={step_s:.2f}"
             )
 
     return float(np.mean(losses)) if losses else float("nan")
@@ -666,7 +665,7 @@ def main():
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.epochs)
 
-    best_val_bce = float("inf")
+    best_val_avg_rnet = -float("inf")
     best_path = os.path.join(args.outdir, "best_model.pt")
 
     logger.info("training start")
@@ -685,6 +684,25 @@ def main():
 
         val_metrics = evaluate_classifier(model, val_loader, cfg.device)
 
+        # --- NEW: profit-oriented validation metrics (do NOT rely on BCE/acc for trading) ---
+        thresholds = np.linspace(0.50, 0.90, cfg.threshold_grid, dtype=np.float32)
+        val_thr, val_info = threshold_search_for_profitability(
+            model=model,
+            dataset=val_ds,
+            device=cfg.device,
+            thresholds=thresholds,
+            min_trades=cfg.min_trades_val,
+        )
+
+        val_trades = int(val_info.get("trades", 0))
+        val_avg_rnet = float(val_info.get("avg_rnet", float("nan")))
+        val_winrate = float(val_info.get("winrate", float("nan")))
+
+        logger.info(
+            f"[VAL] thr={val_thr:.3f} trades={val_trades} "
+            f"avg_rnet={val_avg_rnet:.6f} winrate={val_winrate:.3f}"
+        )
+
         ep_time = time.time() - ep_t0
         logger.info(
             f"E{epoch:03d} DONE "
@@ -694,14 +712,28 @@ def main():
             f"epoch_time_s={ep_time:.1f}"
         )
 
-        if val_metrics["bce"] < best_val_bce:
-            best_val_bce = val_metrics["bce"]
-            torch.save({"model_state": model.state_dict(), "cfg": cfg.__dict__}, best_path)
-            logger.info(f"E{epoch:03d} checkpoint saved: {best_path} (best_val_bce={best_val_bce:.6f})")
+        # --- NEW: checkpoint by profitability proxy, not BCE ---
+        if np.isfinite(val_avg_rnet) and val_trades >= cfg.min_trades_val and val_avg_rnet > best_val_avg_rnet:
+            best_val_avg_rnet = val_avg_rnet
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state": model.state_dict(),
+                    "opt_state": opt.state_dict(),
+                    "val_thr": val_thr,
+                    "val_info": val_info,
+                    "cfg": asdict(cfg),
+                },
+                best_path,
+            )
+            logger.info(
+                f"[CKPT] saved {os.path.basename(best_path)} "
+                f"(best_val_avg_rnet={best_val_avg_rnet:.6f}, trades={val_trades}, thr={val_thr:.3f})"
+            )
 
         sched.step()
 
-    safe_log(f"[INFO] best model saved: {best_path} (best_val_bce={best_val_bce:.4f})")
+    safe_log(f"[INFO] best model saved: {best_path} (best_val_avg_rnet={best_val_avg_rnet:.6f})")
 
     # Reload best
     ckpt = torch.load(best_path, map_location=cfg.device)
