@@ -112,7 +112,7 @@ class Config:
     horizon: int = 5  # H (forward return horizon)
     batch_size: int = 512
     epochs: int = 30
-    lr: float = 2e-3
+    lr: float = 5e-4
     weight_decay: float = 1e-4
     dropout: float = 0.1
     num_workers: int = 0
@@ -201,6 +201,16 @@ class CubeProfitDataset(Dataset):
                 if require_close_obs:
                     if close_mask[a, t] == 0 or close_mask[a, t + horizon] == 0:
                         continue
+                # Apply ignore band already in anchor construction (so we don't train on ignored samples) ---
+                if self.theta > 0.0:
+                    c0 = float(self.close_raw[a, t])
+                    c1 = float(self.close_raw[a, t + horizon])
+                    if c0 <= 0 or c1 <= 0:
+                        continue
+                    r_net = math.log(c1 / c0) - self.cost
+                    if not (r_net > self.theta or r_net < -self.theta):
+                        continue
+
                 anchors.append((a, t))
 
         self.anchors = anchors
@@ -238,22 +248,9 @@ class CubeProfitDataset(Dataset):
             r = math.log(c1 / c0)
             r_net = r - self.cost
 
-            theta = self.theta
-            if theta > 0.0:
-                if r_net > theta:
-                    y = 1.0
-                    valid = 1.0
-                elif r_net < -theta:
-                    y = 0.0
-                    valid = 1.0
-                else:
-                    # Ignore-zone: zu kleine Bewegung => kein Trainingssignal
-                    y = 0.0
-                    valid = 0.0
-            else:
-                # Fallback: altes Verhalten (profit > 0)
-                y = 1.0 if (r_net > 0.0) else 0.0
-                valid = 1.0
+            # After anchor filtering, all remaining samples are outside the ignore-band.
+            y = 1.0 if (r_net > 0.0) else 0.0
+            valid = 1.0
 
         # Return as tensors; CNN expects [C,L]
         x_t = torch.from_numpy(x_cat.T).float()  # (2F, L)
@@ -344,68 +341,82 @@ def evaluate_classifier(
 
 @torch.no_grad()
 def threshold_search_for_profitability(
-        model: nn.Module,
-        dataset: CubeProfitDataset,
-        device: str,
-        thresholds: np.ndarray,
-        min_trades: int,
+    model: nn.Module,
+    dataset: CubeProfitDataset,
+    device: str,
+    thresholds: np.ndarray,
+    min_trades: int,
 ) -> Tuple[float, Dict[str, float]]:
     """
-    Uses the dataset definition itself for realized y (profit label).
-    Decision: trade if p > thr (Long), else Flat.
-    Optimize mainly win-rate; report also trade count and hit-rate.
+    Choose threshold to maximize expected net log-return per trade on validation.
+    Decision: trade if p > thr else flat.
     """
     model.eval()
 
-    # run in reasonably sized batches without DataLoader overhead
     B = 2048
     n = len(dataset)
+
     probs = np.zeros((n,), dtype=np.float32)
-    y = np.zeros((n,), dtype=np.float32)
+    rnet = np.zeros((n,), dtype=np.float32)
     v = np.zeros((n,), dtype=np.float32)
 
     for i in range(0, n, B):
         batch = [dataset[j] for j in range(i, min(i + B, n))]
         x = torch.stack([b[0] for b in batch], dim=0).to(device)
-        y_b = torch.stack([b[1] for b in batch], dim=0).cpu().numpy().squeeze(1)
-        v_b = torch.stack([b[2] for b in batch], dim=0).cpu().numpy().squeeze(1)
 
+        # compute p
         logit = model(x).detach().cpu().numpy().squeeze(1)
         p = 1.0 / (1.0 + np.exp(-logit))
-
         probs[i:i + len(batch)] = p.astype(np.float32)
-        y[i:i + len(batch)] = y_b.astype(np.float32)
-        v[i:i + len(batch)] = v_b.astype(np.float32)
+
+        v[i:i + len(batch)] = 1.0
+
+        for k, (a, t) in enumerate(dataset.anchors[i:i + len(batch)]):
+            c0 = float(dataset.close_raw[a, t])
+            c1 = float(dataset.close_raw[a, t + dataset.horizon])
+            if c0 <= 0.0 or c1 <= 0.0:
+                rnet[i + k] = 0.0
+                v[i + k] = 0.0
+            else:
+                rnet[i + k] = float(math.log(c1 / c0) - dataset.cost)
 
     valid = (v > 0.5)
     probs = probs[valid]
-    y = y[valid]
+    rnet = rnet[valid]
 
     best_thr = 0.5
-    best_score = -1.0
-    best_info = {}
+    best_score = -1e9
+    best_info: Dict[str, float] = {}
 
     for thr in thresholds:
         take = probs > thr
         trades = int(take.sum())
         if trades < min_trades:
             continue
-        winrate = float(y[take].mean())  # mean of profit-label among taken trades
-        # prefer high winrate, but penalize tiny trade counts slightly
-        score = winrate - 0.01 * (1.0 / math.sqrt(trades))
+
+        avg_r = float(rnet[take].mean())
+        winrate = float((rnet[take] > 0.0).mean())
+
+        # score: expected net return per trade (primary), small penalty for very low trade count
+        score = avg_r - 0.0001 * (1.0 / math.sqrt(trades))
 
         if score > best_score:
             best_score = score
             best_thr = float(thr)
-            best_info = {"trades": trades, "winrate": winrate, "score": float(score)}
+            best_info = {
+                "trades": trades,
+                "avg_rnet": avg_r,
+                "winrate": winrate,
+                "score": float(score),
+            }
 
     if not best_info:
-        # fallback: 0.5
         take = probs > 0.5
         trades = int(take.sum())
-        winrate = float(y[take].mean()) if trades > 0 else float("nan")
-        best_info = {"trades": trades, "winrate": winrate, "score": float("nan")}
+        avg_r = float(rnet[take].mean()) if trades > 0 else float("nan")
+        winrate = float((rnet[take] > 0.0).mean()) if trades > 0 else float("nan")
         best_thr = 0.5
+        best_info = {"trades": trades, "avg_rnet": avg_r, "winrate": winrate, "score": float("nan")}
 
     return best_thr, best_info
 
@@ -437,6 +448,7 @@ def train_one_epoch(
 
         opt.zero_grad(set_to_none=True)
         logit = model(x)
+        logit = torch.clamp(logit, -10.0, 10.0)  # stabilizes BCE under noisy labels
 
         loss_raw = loss_fn(logit, y)
         loss = (loss_raw * v).sum() / (v.sum() + 1e-9)
@@ -557,8 +569,6 @@ def main():
     logger = setup_logger(args.outdir)
     logger.info(f"device={cfg.device}")
 
-    safe_log(f"[INFO] device={cfg.device}")
-
     X = np.load(args.dataset)  # (A,T,F) float32
     M = np.load(args.mask)  # (A,T,F) uint8
     assets = load_text_lines(args.assets)
@@ -654,6 +664,7 @@ def main():
     in_ch = 2 * F
     model = ConvNet1D(in_ch=in_ch, dropout=cfg.dropout).to(cfg.device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.epochs)
 
     best_val_bce = float("inf")
     best_path = os.path.join(args.outdir, "best_model.pt")
@@ -688,6 +699,8 @@ def main():
             torch.save({"model_state": model.state_dict(), "cfg": cfg.__dict__}, best_path)
             logger.info(f"E{epoch:03d} checkpoint saved: {best_path} (best_val_bce={best_val_bce:.6f})")
 
+        sched.step()
+
     safe_log(f"[INFO] best model saved: {best_path} (best_val_bce={best_val_bce:.4f})")
 
     # Reload best
@@ -703,8 +716,12 @@ def main():
         thresholds=thresholds,
         min_trades=cfg.min_trades_val,
     )
-    safe_log(
-        f"[INFO] chosen threshold on val: thr={thr:.3f} | trades={info.get('trades')} | winrate={info.get('winrate'):.3f}")
+    logger.info(
+        f"[VAL] chosen threshold: thr={thr:.3f} "
+        f"| trades={info.get('trades')} "
+        f"| winrate={info.get('winrate'):.3f} "
+        f"| avg_rnet={info.get('avg_rnet'):.6f}"
+    )
 
     # Report test metrics (classifier)
     test_metrics = evaluate_classifier(model, test_loader, cfg.device)
