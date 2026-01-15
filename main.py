@@ -1119,19 +1119,22 @@ if __name__ == "__main__":
     # ------------------------------------------------------------
     import sys
 
-    sys.argv = [
-        sys.argv[0],
-        "--dataset", DATASET_NPY,
-        "--mask", MASK_NPY,
-        "--assets", ASSETS_TXT,
-        "--dates", DATES_TXT,
-        "--features", FEATURES_JS,
-        "--outdir", OUTDIR,
-        "--train_frac", str(TRAIN_FRAC),
-        "--val_frac", str(VAL_FRAC),
-    ]
-
-    if FOCUS_ASSET:
-        sys.argv += ["--asset_name", FOCUS_ASSET]
+    # If script is started with CLI args (terminal), don't overwrite them.
+    # Only inject IDE defaults when no args were provided.
+    if len(sys.argv) == 1:
+        sys.argv = [
+            sys.argv[0],
+            "--dataset", DATASET_NPY,
+            "--mask", MASK_NPY,
+            "--assets", ASSETS_TXT,
+            "--dates", DATES_TXT,
+            "--features", FEATURES_JS,
+            "--outdir", OUTDIR,
+            "--train_frac", str(TRAIN_FRAC),
+            "--val_frac", str(VAL_FRAC),
+        ]
+        if FOCUS_ASSET:
+            sys.argv += ["--asset_name", FOCUS_ASSET]
 
     main()
+
