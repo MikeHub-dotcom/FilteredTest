@@ -35,6 +35,14 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
+from pathlib import Path
+
+def project_root() -> Path:
+    # Ordner, in dem diese main.py liegt
+    return Path(__file__).resolve().parent
+
+def dataset_dir() -> Path:
+    return project_root() / "dataset"
 
 # ----------------------------
 # Utilities
@@ -1091,37 +1099,23 @@ def main():
 
 
 if __name__ == "__main__":
-    # ------------------------------------------------------------
-    # IDE RUN CONFIG (set your paths here)
-    # ------------------------------------------------------------
-    ROOT_DIR = str(Path(__file__).resolve().parent)
-
-    DATASET_NPY = ROOT_DIR + "/dataset/dataset_2026-01-13_masked.npy"
-    MASK_NPY = ROOT_DIR + "/dataset/mask_2026-01-13_masked.npy"
-    ASSETS_TXT = ROOT_DIR + "/dataset/assets_2026-01-13.txt"
-    DATES_TXT = ROOT_DIR + "/dataset/dates_2026-01-13.txt"
-    FEATURES_JS = ROOT_DIR + "/dataset/features_2026-01-13.json"
-
-    OUTDIR = ROOT_DIR + "/runs"
-    FOCUS_ASSET = ""  # e.g. "DRO.AX" or "" to disable
-
-    # Optional: override split fractions (must satisfy train+val < 1)
-    TRAIN_FRAC = 0.70
-    VAL_FRAC = 0.15
-
-    # Optional: quick sanity checks
-    for p in [DATASET_NPY, MASK_NPY, ASSETS_TXT, DATES_TXT, FEATURES_JS]:
-        if not os.path.exists(p):
-            raise FileNotFoundError(f"Missing file: {p}")
-
-    # ------------------------------------------------------------
-    # Emulate argparse.Namespace and call main() logic
-    # ------------------------------------------------------------
     import sys
+    from pathlib import Path
 
-    # If script is started with CLI args (terminal), don't overwrite them.
-    # Only inject IDE defaults when no args were provided.
+    ROOT = Path(__file__).resolve().parent
+    DSET = ROOT / "dataset"
+
+    # IDE defaults only if no CLI args were provided
     if len(sys.argv) == 1:
+        # Passe die Dateinamen hier an deine echten Namen im dataset/ Ordner an:
+        DATASET_NPY = str(DSET / "dataset_2026-01-13_masked.npy")
+        MASK_NPY    = str(DSET / "mask_2026-01-13_masked.npy")
+        ASSETS_TXT  = str(DSET / "assets_2026-01-13.txt")
+        DATES_TXT   = str(DSET / "dates_2026-01-13.txt")
+        FEATURES_JS = str(DSET / "features_2026-01-13.json")
+
+        OUTDIR = str(ROOT / "runs")
+
         sys.argv = [
             sys.argv[0],
             "--dataset", DATASET_NPY,
@@ -1130,11 +1124,9 @@ if __name__ == "__main__":
             "--dates", DATES_TXT,
             "--features", FEATURES_JS,
             "--outdir", OUTDIR,
-            "--train_frac", str(TRAIN_FRAC),
-            "--val_frac", str(VAL_FRAC),
+            "--train_frac", "0.70",
+            "--val_frac", "0.15",
         ]
-        if FOCUS_ASSET:
-            sys.argv += ["--asset_name", FOCUS_ASSET]
 
     main()
 
