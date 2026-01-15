@@ -173,7 +173,7 @@ def sample_trial_cfg(base: Config, rng: np.random.Generator) -> Config:
     # ----------------------------
     # 1) Model choice (prioritize TCN)
     # ----------------------------
-    cfg.model_type = str(rng.choice(["tcn", "tcn", "tcn", "cnn"]))  # 75% TCN, 25% CNN-baseline
+    cfg.model_type = str(rng.choice(["tcn"]))  # TCN only in dieser Konfiguration
 
     # ----------------------------
     # 2) Signal / trading-relevant params
@@ -930,10 +930,30 @@ def main():
     ap.add_argument("--trials", type=int, default=48, help="Number of sweep trials")
     ap.add_argument("--sweep_epochs", type=int, default=2, help="Epochs per trial during sweep screening")
     ap.add_argument("--sweep_seed", type=int, default=1234, help="Base RNG seed for sweep sampling")
+    # ----------------------------
+    # Train-from-trial (load cfg.json)
+    # ----------------------------
+    ap.add_argument("--cfg", default="", help="Optional: path to a cfg.json from a sweep trial to override Config")
+    ap.add_argument("--epochs", type=int, default=0, help="Optional: override cfg.epochs (useful for full training)")
+
 
     args = ap.parse_args()
 
     cfg = Config()
+
+    # Optional: override Config from a sweep-trial cfg.json (reproducibility)
+    if args.cfg:
+        with open(args.cfg, "r", encoding="utf-8") as f:
+            d = json.load(f)
+
+        for k, v in d.items():
+            if hasattr(cfg, k):
+                setattr(cfg, k, v)
+
+    # Optional: override epochs from CLI (takes precedence over cfg.json)
+    if args.epochs and args.epochs > 0:
+        cfg.epochs = int(args.epochs)
+
     set_seed(cfg.seed)
     os.makedirs(args.outdir, exist_ok=True)
 
@@ -941,7 +961,7 @@ def main():
     logger.info(f"device={cfg.device}")
 
     torch.backends.cudnn.benchmark = bool(cfg.cudnn_benchmark)
-    scaler = scaler = AmpGradScaler(amp_device_type(cfg.device), enabled=(cfg.amp and str(cfg.device).startswith("cuda")))
+    scaler = AmpGradScaler(amp_device_type(cfg.device), enabled=(cfg.amp and str(cfg.device).startswith("cuda")))
 
 
     X = np.load(args.dataset)  # (A,T,F) float32
