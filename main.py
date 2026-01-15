@@ -35,6 +35,20 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
+# --- AMP compatibility (PyTorch >= 2.0 prefers torch.amp.*) ---
+try:
+    from torch.amp import autocast as amp_autocast
+    from torch.amp import GradScaler as AmpGradScaler
+except Exception:  # fallback for older torch
+    from torch.cuda.amp import autocast as amp_autocast
+    from torch.cuda.amp import GradScaler as AmpGradScaler
+
+
+def amp_device_type(device: str) -> str:
+    # torch.amp wants "cuda"/"cpu" etc.
+    return "cuda" if str(device).startswith("cuda") else "cpu"
+
+
 
 # ----------------------------
 # Utilities
@@ -205,7 +219,7 @@ def run_single_training(
     logger.info(f"device={cfg.device}")
     set_seed(int(cfg.seed_trials))
     torch.backends.cudnn.benchmark = bool(cfg.cudnn_benchmark)
-    scaler = torch.cuda.amp.GradScaler(enabled=(cfg.amp and cfg.device.startswith("cuda")))
+    scaler = AmpGradScaler(amp_device_type(cfg.device), enabled=(cfg.amp and str(cfg.device).startswith("cuda")))
 
     (tr_s, tr_e), (va_s, va_e), (te_s, te_e) = splits
     A, T, F = X.shape
@@ -633,7 +647,7 @@ def train_one_epoch(
 
         use_amp = bool(amp and device.startswith("cuda") and scaler is not None)
 
-        with torch.cuda.amp.autocast(enabled=use_amp):
+        with amp_autocast(amp_device_type(device), enabled=use_amp):
             logit = model(x)
             logit = torch.clamp(logit, -10.0, 10.0)
             loss_raw = loss_fn(logit, y)
@@ -772,7 +786,8 @@ def main():
     logger.info(f"device={cfg.device}")
 
     torch.backends.cudnn.benchmark = bool(cfg.cudnn_benchmark)
-    scaler = torch.cuda.amp.GradScaler(enabled=(cfg.amp and cfg.device.startswith("cuda")))
+    scaler = scaler = AmpGradScaler(amp_device_type(cfg.device), enabled=(cfg.amp and str(cfg.device).startswith("cuda")))
+
 
     X = np.load(args.dataset)  # (A,T,F) float32
     M = np.load(args.mask)  # (A,T,F) uint8
