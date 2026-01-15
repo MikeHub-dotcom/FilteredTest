@@ -152,35 +152,72 @@ class Config:
     cudnn_benchmark: bool = True
     grad_clip: float = 1.0
 
+    # --- Model selection ---
+    model_type: str = "tcn"   # "cnn" (old ConvNet1D) or "tcn"
+
+    # --- TCN hyperparameters (finance-robust defaults) ---
+    tcn_channels: int = 192        # base width
+    tcn_levels: int = 5            # number of residual blocks (dilations 1,2,4,...)
+    tcn_kernel_size: int = 5       # 3/5/7
+    tcn_dropout: float = 0.10      # separate dropout for TCN (often works better than sharing cfg.dropout)
+    tcn_use_groupnorm: bool = True # GN tends to be stable with large batch / non-stationary signals
+
 
 def sample_trial_cfg(base: Config, rng: np.random.Generator) -> Config:
     """
-    Professionell gewählter, kompakter Suchraum: fokus auf signalrelevante Parameter.
-    - horizon/lookback/theta dominieren Signal/Noise + Trade-Frequenz
-    - lr/wd/dropout stabilisieren Generalisierung
+    Architektur- und signal-fokussierter Sweep für Finanzdaten.
+    Ziel: robuste Generalisierung + sinnvolle Trade-Frequenz.
     """
     cfg = Config(**asdict(base))
 
-    # Signal / trade-frequency drivers
-    cfg.horizon = int(rng.choice([3, 5, 10]))
-    cfg.lookback = int(rng.choice([64, 96, 128]))
-    cfg.ignore_band_logret = float(rng.choice([0.010, 0.015, 0.020]))
+    # ----------------------------
+    # 1) Model choice (prioritize TCN)
+    # ----------------------------
+    cfg.model_type = str(rng.choice(["tcn", "tcn", "tcn", "cnn"]))  # 75% TCN, 25% CNN-baseline
 
-    # Conservative cost robustness (optional but recommended)
+    # ----------------------------
+    # 2) Signal / trading-relevant params
+    # ----------------------------
+    cfg.horizon = int(rng.choice([3, 5, 10]))             # aligns with 2-3 trades/week (esp. with ignore band + high thr)
+    cfg.lookback = int(rng.choice([64, 96, 128, 192]))    # longer lookback helps regime/noise smoothing
+    cfg.ignore_band_logret = float(rng.choice([0.010, 0.015, 0.020, 0.025]))
     cfg.roundtrip_cost_bps = float(rng.choice([20.0, 35.0, 50.0]))
 
-    # Optimization / regularization
-    cfg.lr = float(rng.choice([3e-4, 5e-4, 8e-4]))
+    # ----------------------------
+    # 3) Optimization
+    # ----------------------------
+    # TCN tolerates a bit higher LR than transformer-like models; keep conservative set
+    cfg.lr = float(rng.choice([3e-4, 5e-4, 8e-4, 1.2e-3]))
     cfg.weight_decay = float(rng.choice([1e-5, 1e-4, 5e-4]))
-    cfg.dropout = float(rng.choice([0.05, 0.10, 0.20]))
-
-    # Keep stable
-    cfg.batch_size = int(rng.choice([512, 768, 1024]))  # 4090 typically ok; adjust if OOM
     cfg.grad_clip = float(rng.choice([0.5, 1.0, 2.0]))
-    cfg.threshold_grid = 81
-    cfg.min_trades_val = 200  # Screening: avoids "1 lucky trade" winners
 
-    # Sweep speed (screening)
+    # Batch (4090 friendly); keep not too large to avoid dataloader overhead
+    cfg.batch_size = int(rng.choice([512, 768, 1024]))
+
+    # ----------------------------
+    # 4) Model regularization
+    # ----------------------------
+    cfg.dropout = float(rng.choice([0.05, 0.10, 0.20]))  # used by CNN head
+    cfg.tcn_dropout = float(rng.choice([0.05, 0.10, 0.20]))
+
+    # ----------------------------
+    # 5) TCN architecture params (if model_type=tcn)
+    # ----------------------------
+    # Receptive field grows with levels and dilation; these ranges are good for daily OHLCV
+    cfg.tcn_channels = int(rng.choice([128, 192, 256]))
+    cfg.tcn_levels = int(rng.choice([4, 5, 6]))          # 1+2+4+8+... -> long effective memory
+    cfg.tcn_kernel_size = int(rng.choice([3, 5, 7]))
+    cfg.tcn_use_groupnorm = True
+
+    # ----------------------------
+    # 6) Validation threshold search params (avoid "lucky few trades")
+    # ----------------------------
+    cfg.threshold_grid = 81
+    cfg.min_trades_val = 200
+
+    # ----------------------------
+    # 7) Sweep speed (screening)
+    # ----------------------------
     cfg.epochs = 2  # overwritten by args.sweep_epochs at runtime
     cfg.max_anchors_train = int(rng.choice([800_000, 1_200_000, 1_500_000]))
     cfg.max_anchors_val = int(rng.choice([300_000, 450_000, 600_000]))
@@ -265,7 +302,7 @@ def run_single_training(
     val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False,
                             num_workers=cfg.num_workers, pin_memory=pin)
 
-    model = ConvNet1D(in_ch=2 * F, dropout=cfg.dropout).to(cfg.device)
+    model = build_model(cfg, in_ch=2 * F).to(cfg.device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.epochs)
 
@@ -487,6 +524,124 @@ class ConvNet1D(nn.Module):
         z = self.net(x)
         logit = self.head(z)
         return logit
+
+
+class ResidualTCNBlock(nn.Module):
+    """
+    Finance-robuster TCN Block:
+    - two dilated convs
+    - residual connection (with 1x1 projection if needed)
+    - GroupNorm (stable) + GELU
+    """
+    def __init__(
+        self,
+        in_ch: int,
+        out_ch: int,
+        kernel_size: int,
+        dilation: int,
+        dropout: float,
+        use_groupnorm: bool = True,
+    ):
+        super().__init__()
+        padding = (kernel_size - 1) * dilation // 2  # keep length
+        self.conv1 = nn.Conv1d(in_ch, out_ch, kernel_size=kernel_size, dilation=dilation, padding=padding)
+        self.conv2 = nn.Conv1d(out_ch, out_ch, kernel_size=kernel_size, dilation=dilation, padding=padding)
+
+        if use_groupnorm:
+            # groups: small number for stability; ensure divisibility
+            g1 = 8 if out_ch % 8 == 0 else 4 if out_ch % 4 == 0 else 1
+            self.norm1 = nn.GroupNorm(g1, out_ch)
+            self.norm2 = nn.GroupNorm(g1, out_ch)
+        else:
+            self.norm1 = nn.BatchNorm1d(out_ch)
+            self.norm2 = nn.BatchNorm1d(out_ch)
+
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(dropout)
+
+        self.proj = None
+        if in_ch != out_ch:
+            self.proj = nn.Conv1d(in_ch, out_ch, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.conv1(x)
+        h = self.norm1(h)
+        h = self.act(h)
+        h = self.drop(h)
+
+        h = self.conv2(h)
+        h = self.norm2(h)
+        h = self.act(h)
+        h = self.drop(h)
+
+        r = x if self.proj is None else self.proj(x)
+        return h + r
+
+
+class TCNModel(nn.Module):
+    """
+    TCN for (B, C, L) with explicit mask-channel included in C.
+    - dilations grow exponentially -> long receptive field
+    - adaptive pooling -> single logit
+    """
+    def __init__(
+        self,
+        in_ch: int,
+        channels: int = 192,
+        levels: int = 5,
+        kernel_size: int = 5,
+        dropout: float = 0.10,
+        use_groupnorm: bool = True,
+    ):
+        super().__init__()
+        blocks = []
+        ch_in = in_ch
+        for i in range(levels):
+            d = 2 ** i
+            blocks.append(
+                ResidualTCNBlock(
+                    in_ch=ch_in,
+                    out_ch=channels,
+                    kernel_size=kernel_size,
+                    dilation=d,
+                    dropout=dropout,
+                    use_groupnorm=use_groupnorm,
+                )
+            )
+            ch_in = channels
+
+        self.backbone = nn.Sequential(*blocks)
+        self.pool = nn.AdaptiveAvgPool1d(1)  # (B,channels,1)
+
+        # small head; keep it simple for finance robustness
+        self.head = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(channels, channels // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(channels // 2, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        z = self.backbone(x)
+        z = self.pool(z)
+        return self.head(z)
+
+
+def build_model(cfg: Config, in_ch: int) -> nn.Module:
+    mt = str(cfg.model_type).lower().strip()
+    if mt == "cnn":
+        return ConvNet1D(in_ch=in_ch, dropout=cfg.dropout)
+    if mt == "tcn":
+        return TCNModel(
+            in_ch=in_ch,
+            channels=int(cfg.tcn_channels),
+            levels=int(cfg.tcn_levels),
+            kernel_size=int(cfg.tcn_kernel_size),
+            dropout=float(cfg.tcn_dropout),
+            use_groupnorm=bool(cfg.tcn_use_groupnorm),
+        )
+    raise ValueError(f"Unknown model_type='{cfg.model_type}'. Use 'cnn' or 'tcn'.")
 
 
 # ----------------------------
@@ -863,11 +1018,13 @@ def main():
             leaderboard.append(row)
 
             safe_log(
-                f"[SWEEP] trial={trial:04d} "
+                f"[SWEEP] trial={trial:04d} model={trial_cfg.model_type} "
                 f"avg_rnet={metrics['best_val_avg_rnet']:.6f} trades={metrics['best_val_trades']} "
                 f"thr={metrics['best_val_thr']:.3f} "
                 f"L={trial_cfg.lookback} H={trial_cfg.horizon} theta={trial_cfg.ignore_band_logret:.3f} "
-                f"lr={trial_cfg.lr:.1e} wd={trial_cfg.weight_decay:.1e} do={trial_cfg.dropout:.2f} "
+                f"lr={trial_cfg.lr:.1e} wd={trial_cfg.weight_decay:.1e} "
+                f"do={trial_cfg.dropout:.2f} tcn_do={trial_cfg.tcn_dropout:.2f} "
+                f"tcn(ch={trial_cfg.tcn_channels},lv={trial_cfg.tcn_levels},k={trial_cfg.tcn_kernel_size}) "
                 f"cost={trial_cfg.roundtrip_cost_bps:.0f}bps time={dt:.1f}s"
             )
 
@@ -877,7 +1034,7 @@ def main():
         top_path = os.path.join(sweep_outdir, "leaderboard_top.csv")
         with open(top_path, "w", encoding="utf-8") as f:
             cols = [
-                "trial", "best_val_avg_rnet", "best_val_trades", "best_val_thr", "best_val_winrate",
+                "trial", "model_type", "best_val_avg_rnet", "best_val_trades", "best_val_thr", "best_val_winrate",
                 "lookback", "horizon", "ignore_band_logret", "lr", "weight_decay", "dropout",
                 "roundtrip_cost_bps", "batch_size", "max_anchors_train", "max_anchors_val",
                 "best_val_bce", "best_val_acc", "time_s"
@@ -970,7 +1127,7 @@ def main():
 
     # Model
     in_ch = 2 * F
-    model = ConvNet1D(in_ch=in_ch, dropout=cfg.dropout).to(cfg.device)
+    model = build_model(cfg, in_ch=in_ch).to(cfg.device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.epochs)
 
