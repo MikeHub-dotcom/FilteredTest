@@ -19,6 +19,11 @@ Core idea:
 Dependencies:
   pip install numpy pandas torch
 """
+from datetime import datetime
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")  # headless saving (no GUI)
+import matplotlib.pyplot as plt
 
 import argparse
 import json
@@ -771,6 +776,429 @@ def threshold_search_for_profitability(
 
 
 # ----------------------------
+# TEST REPORT + REALISTIC TRADING SIM
+# ----------------------------
+def _project_root_from_dataset_path(dataset_path: str) -> str:
+    # dataset/dataset_*.npy -> project root
+    p = Path(dataset_path).resolve()
+    # if dataset folder exists in parent, treat parent as root
+    if p.parent.name.lower() == "dataset":
+        return str(p.parent.parent)
+    return str(p.parent)
+
+
+def load_isin_name_map(misc_dir: str) -> Dict[str, str]:
+    """
+    Build ISIN->Name map from /misc CSVs (Trade Republic exports).
+    Robust to column naming differences.
+    """
+    mp: Dict[str, str] = {}
+    misc = Path(misc_dir)
+    candidates = [
+        misc / "TR_Stocks_07_25.csv",
+        misc / "TR_ETFs_07_25.csv",
+    ]
+    for fp in candidates:
+        if not fp.exists():
+            continue
+        try:
+            df = pd.read_csv(fp)
+        except Exception:
+            # try semicolon
+            df = pd.read_csv(fp, sep=";")
+
+        cols = {c.lower(): c for c in df.columns}
+
+        # find ISIN col
+        isin_col = None
+        for k in cols:
+            if "isin" == k or "isin" in k:
+                isin_col = cols[k]
+                break
+        if isin_col is None:
+            continue
+
+        # find name col
+        name_col = None
+        for key in ["name", "instrument", "bezeichnung", "company", "title", "produkt"]:
+            for k in cols:
+                if key == k or key in k:
+                    name_col = cols[k]
+                    break
+            if name_col is not None:
+                break
+        if name_col is None:
+            # fallback: first non-isin text col
+            for c in df.columns:
+                if c == isin_col:
+                    continue
+                if df[c].dtype == object:
+                    name_col = c
+                    break
+
+        if name_col is None:
+            continue
+
+        for _, row in df[[isin_col, name_col]].dropna().iterrows():
+            isin = str(row[isin_col]).strip()
+            nm = str(row[name_col]).strip()
+            if isin and isin not in mp:
+                mp[isin] = nm
+
+    return mp
+
+
+@torch.no_grad()
+def predict_probs_for_asset(
+    model: nn.Module,
+    X: np.ndarray,
+    M: np.ndarray,
+    a: int,
+    t0: int,
+    t1: int,
+    lookback: int,
+    device: str,
+    batch: int = 2048,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Returns times ts and probabilities p(ts) for anchors t in [t0..t1]
+    where t>=lookback-1 and (close mask at t) can be checked outside.
+    """
+    model.eval()
+    A, T, F = X.shape
+    assert 0 <= a < A
+
+    ts = np.arange(t0, t1 + 1, dtype=np.int32)
+    # build sequences
+    seqs = []
+    valid_t = []
+
+    for t in ts:
+        if t < lookback - 1:
+            continue
+        x_win = X[a, t - lookback + 1:t + 1, :]  # (L,F)
+        m_win = M[a, t - lookback + 1:t + 1, :].astype(np.float32)
+        x_cat = np.concatenate([x_win, m_win], axis=1)  # (L,2F)
+        seqs.append(torch.from_numpy(x_cat.T).float())  # (2F,L)
+        valid_t.append(t)
+
+    if not valid_t:
+        return np.array([], dtype=np.int32), np.array([], dtype=np.float32)
+
+    probs = np.zeros((len(valid_t),), dtype=np.float32)
+
+    for i in range(0, len(valid_t), batch):
+        xb = torch.stack(seqs[i:i + batch], dim=0).to(device)
+        logit = model(xb).detach().cpu().numpy().squeeze(1)
+        p = 1.0 / (1.0 + np.exp(-logit))
+        probs[i:i + len(p)] = p.astype(np.float32)
+
+    return np.array(valid_t, dtype=np.int32), probs
+
+
+def simulate_long_flat(
+    close: np.ndarray,
+    ts: np.ndarray,
+    probs: np.ndarray,
+    thr_enter: float,
+    hysteresis: float,
+    exec_delay_days: int,
+    initial_cash: float,
+    trade_fee_eur_roundtrip: float,
+) -> Dict[str, object]:
+    """
+    Simple but realistic per-asset long/flat simulation:
+    - signal at day t based on prob(t)
+    - execute at day t+delay using Close (conservative vs same-day)
+    - long 100% notional with available cash (one position at a time)
+    - one completed trade = buy then sell; apply roundtrip fee at exit
+    Returns trades list and equity curve.
+    """
+    assert close.ndim == 1
+    n = close.shape[0]
+
+    thr_exit = max(0.0, thr_enter - float(hysteresis))
+    delay = int(max(0, exec_delay_days))
+
+    cash = float(initial_cash)
+    shares = 0.0
+    in_pos = False
+    entry_idx = None
+    entry_price = None
+
+    equity = np.full((n,), np.nan, dtype=np.float64)
+    buys, sells = [], []
+    spans = []  # (buy_idx, sell_idx, pnl_frac)
+
+    # decision points: ts corresponds to close indices
+    tset = set(int(t) for t in ts.tolist())
+    pmap = {int(t): float(p) for t, p in zip(ts.tolist(), probs.tolist())}
+
+    for t in range(n):
+        px = float(close[t])
+        if px <= 0:
+            equity[t] = cash + shares * 0.0
+            continue
+
+        # mark-to-market
+        equity[t] = cash + shares * px
+
+        if t not in tset:
+            continue
+
+        p = pmap[t]
+
+        # determine desired state at decision t (before execution delay)
+        want_long = (p >= thr_enter) if not in_pos else (p >= thr_exit)
+
+        # execute at te = t+delay
+        te = t + delay
+        if te >= n:
+            continue
+        ex_price = float(close[te])
+        if ex_price <= 0:
+            continue
+
+        if (not in_pos) and want_long:
+            # BUY with all cash
+            if cash > 0:
+                shares = cash / ex_price
+                cash = 0.0
+                in_pos = True
+                entry_idx = te
+                entry_price = ex_price
+                buys.append(te)
+
+        elif in_pos and (not want_long):
+            # SELL all shares
+            proceeds = shares * ex_price
+            shares = 0.0
+            cash = proceeds
+
+            # apply fixed roundtrip fee on completed trade
+            cash = max(0.0, cash - float(trade_fee_eur_roundtrip))
+
+            in_pos = False
+            sells.append(te)
+
+            if entry_idx is not None and entry_price is not None and entry_price > 0:
+                pnl_frac = (ex_price / entry_price) - 1.0
+                spans.append((int(entry_idx), int(te), float(pnl_frac)))
+            entry_idx, entry_price = None, None
+
+    # if still in position at end: close at last price (and apply fee)
+    if in_pos and shares > 0 and close[-1] > 0:
+        proceeds = shares * float(close[-1])
+        shares = 0.0
+        cash = max(0.0, proceeds - float(trade_fee_eur_roundtrip))
+        sells.append(n - 1)
+        if entry_idx is not None and entry_price is not None and entry_price > 0:
+            pnl_frac = (float(close[-1]) / entry_price) - 1.0
+            spans.append((int(entry_idx), int(n - 1), float(pnl_frac)))
+
+    final_equity = float(cash)
+    total_return = (final_equity / float(initial_cash)) - 1.0 if initial_cash > 0 else float("nan")
+    n_trades = int(min(len(buys), len(sells)))
+
+    # winrate over completed trades
+    wins = sum(1 for _, _, pf in spans if pf > 0)
+    winrate = (wins / n_trades) if n_trades > 0 else float("nan")
+
+    return {
+        "equity": equity,
+        "buys": buys,
+        "sells": sells,
+        "spans": spans,
+        "final_equity": final_equity,
+        "total_return": float(total_return),
+        "n_trades": n_trades,
+        "winrate": float(winrate),
+    }
+
+
+def save_trade_plot(
+    out_png: str,
+    dates: List[str],
+    close: np.ndarray,
+    buys: List[int],
+    sells: List[int],
+    spans: List[Tuple[int, int, float]],
+    title: str,
+) -> None:
+    x = np.arange(len(close))
+    plt.figure(figsize=(12, 5))
+    plt.plot(x, close, linewidth=1.2)
+
+    # shaded holding periods
+    for b, s, pnl in spans:
+        if b < 0 or s < 0 or b >= len(close) or s >= len(close):
+            continue
+        color = "green" if pnl > 0 else "red"
+        plt.axvspan(b, s, alpha=0.12, color=color)
+
+    # markers
+    if buys:
+        plt.scatter(buys, close[buys], marker="^")
+    if sells:
+        plt.scatter(sells, close[sells], marker="v")
+
+    plt.title(title)
+    plt.xlabel("t")
+    plt.ylabel("Close")
+
+    # light date ticks
+    if len(dates) == len(close) and len(close) > 10:
+        step = max(1, len(close) // 8)
+        ticks = list(range(0, len(close), step))
+        plt.xticks(ticks, [dates[i] for i in ticks], rotation=25, ha="right")
+
+    plt.tight_layout()
+    Path(out_png).parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_png, dpi=140)
+    plt.close()
+
+
+def run_test_report(
+    model: nn.Module,
+    cfg: Config,
+    Xn: np.ndarray,
+    M: np.ndarray,
+    assets: List[str],
+    dates: List[str],
+    close_raw: np.ndarray,
+    close_idx: int,
+    te_s: int,
+    te_e: int,
+    report_base_dir: str,
+    misc_dir: str,
+    thr: float,
+    logger: logging.Logger,
+    initial_cash: float,
+    trade_fee_eur: float,
+    exec_delay_days: int,
+    hysteresis: float,
+) -> str:
+    """
+    Creates timestamped test report folder with:
+      - summary.csv / summary.json
+      - per-asset plots/<ISIN>.png
+    """
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    outdir = Path(report_base_dir) / f"test_report_{ts}"
+    plots_dir = outdir / "plots"
+    outdir.mkdir(parents=True, exist_ok=True)
+    plots_dir.mkdir(parents=True, exist_ok=True)
+
+    isin2name = load_isin_name_map(misc_dir)
+
+    A, T, F = Xn.shape
+    assert close_raw.shape == (A, T)
+
+    rows = []
+    n_kept = 0
+
+    # test slice per asset
+    for a in range(A):
+        isin = assets[a]
+        # require some observed close points in test range
+        cm = M[a, te_s:te_e + 1, close_idx].astype(bool)
+        if cm.sum() < 50:
+            continue
+
+        close = close_raw[a, te_s:te_e + 1].astype(np.float64)
+        # optionally set missing closes to NaN for plot cleanliness
+        close = close.copy()
+        close[~cm] = np.nan
+
+        # predictions only for valid t where lookback window exists and close observed
+        # decision range must allow execution delay
+        t0 = te_s
+        t1 = te_e - max(0, exec_delay_days)
+        ts_idx, probs = predict_probs_for_asset(
+            model=model,
+            X=Xn,
+            M=M,
+            a=a,
+            t0=t0,
+            t1=t1,
+            lookback=cfg.lookback,
+            device=cfg.device,
+            batch=2048,
+        )
+
+        if len(ts_idx) == 0:
+            continue
+
+        # build local close series without leading NaNs for sim: fill NaNs by skipping trades implicitly
+        # For simulation, treat NaN prices as invalid => equity stays cash and no exec
+        close_sim = np.array(close, dtype=np.float64)
+        close_sim[np.isnan(close_sim)] = 0.0
+
+        sim = simulate_long_flat(
+            close=close_sim,
+            ts=(ts_idx - te_s),          # local index
+            probs=probs,
+            thr_enter=float(thr),
+            hysteresis=float(hysteresis),
+            exec_delay_days=int(exec_delay_days),
+            initial_cash=float(initial_cash),
+            trade_fee_eur_roundtrip=float(trade_fee_eur),
+        )
+
+        name = isin2name.get(isin, "")
+        title = f"{isin}" + (f" — {name}" if name else "")
+        out_png = str(plots_dir / f"{isin}.png")
+        save_trade_plot(
+            out_png=out_png,
+            dates=dates[te_s:te_e + 1],
+            close=np.nan_to_num(close, nan=0.0),
+            buys=sim["buys"],
+            sells=sim["sells"],
+            spans=sim["spans"],
+            title=title,
+        )
+
+        rows.append({
+            "isin": isin,
+            "name": name,
+            "trades": sim["n_trades"],
+            "winrate": sim["winrate"],
+            "final_equity": sim["final_equity"],
+            "total_return_pct": 100.0 * sim["total_return"],
+        })
+        n_kept += 1
+
+    df = pd.DataFrame(rows).sort_values(by="total_return_pct", ascending=False) if rows else pd.DataFrame(
+        columns=["isin", "name", "trades", "winrate", "final_equity", "total_return_pct"]
+    )
+
+    summary_csv = outdir / "summary.csv"
+    df.to_csv(summary_csv, index=False)
+
+    summary = {
+        "n_assets_evaluated": int(n_kept),
+        "thr": float(thr),
+        "lookback": int(cfg.lookback),
+        "horizon": int(cfg.horizon),
+        "roundtrip_cost_bps_label": float(cfg.roundtrip_cost_bps),
+        "initial_cash": float(initial_cash),
+        "trade_fee_eur_roundtrip": float(trade_fee_eur),
+        "exec_delay_days": int(exec_delay_days),
+        "hysteresis": float(hysteresis),
+        "mean_return_pct": float(df["total_return_pct"].mean()) if len(df) else float("nan"),
+        "median_return_pct": float(df["total_return_pct"].median()) if len(df) else float("nan"),
+        "mean_trades": float(df["trades"].mean()) if len(df) else float("nan"),
+    }
+    with open(outdir / "summary.json", "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    logger.info(f"[TESTREPORT] wrote: {str(outdir)}")
+    logger.info(f"[TESTREPORT] assets={summary['n_assets_evaluated']} mean_return_pct={summary['mean_return_pct']:.3f}")
+
+    return str(outdir)
+
+
+# ----------------------------
 # Train loop
 # ----------------------------
 def train_one_epoch(
@@ -935,6 +1363,27 @@ def main():
     # ----------------------------
     ap.add_argument("--cfg", default="", help="Optional: path to a cfg.json from a sweep trial to override Config")
     ap.add_argument("--epochs", type=int, default=0, help="Optional: override cfg.epochs (useful for full training)")
+    # ----------------------------
+    # TEST / REPORT MODE
+    # ----------------------------
+    ap.add_argument("--test_only", action="store_true",
+                    help="Skip training; load model and run test report only.")
+    ap.add_argument("--model_path", default="",
+                    help="Path to a trained checkpoint (.pt). If empty, uses --outdir/best_model.pt")
+    ap.add_argument("--report_dir", default="",
+                    help="Output base dir for test reports. If empty, uses --outdir/test_reports")
+    ap.add_argument("--misc_dir", default="",
+                    help="Project misc dir containing TR_Stocks_*.csv and TR_ETFs_*.csv. If empty, uses <project_root>/misc")
+    ap.add_argument("--test_thr", type=float, default=-1.0,
+                    help="Decision threshold for trading. If <0, uses checkpoint val_thr or re-optimizes on val.")
+    ap.add_argument("--initial_cash", type=float, default=10_000.0,
+                    help="Initial cash per-asset simulation (independent).")
+    ap.add_argument("--trade_fee_eur", type=float, default=1.0,
+                    help="Fixed roundtrip fee in EUR per completed trade (buy+sell).")
+    ap.add_argument("--exec_delay_days", type=int, default=1,
+                    help="Execution delay in days: signal at t, execute at t+delay (using Close). 0=execute same day.")
+    ap.add_argument("--hysteresis", type=float, default=0.02,
+                    help="Hysteresis band: enter at thr, exit at thr-hysteresis to reduce churn.")
 
 
     args = ap.parse_args()
@@ -973,6 +1422,11 @@ def main():
     assert X.shape == M.shape
     A, T, F = X.shape
     safe_log(f"[INFO] loaded cube: A={A}, T={T}, F={F}")
+
+    # --- PATCH: resolve misc/report dirs ---
+    project_root = _project_root_from_dataset_path(args.dataset)
+    misc_dir = args.misc_dir if args.misc_dir else str(Path(project_root) / "misc")
+    report_base = args.report_dir if args.report_dir else str(Path(args.outdir) / "test_reports")
 
     # Identify Close column
     close_idx = None
@@ -1064,6 +1518,72 @@ def main():
                 f.write(",".join(str(r.get(c, "")) for c in cols) + "\n")
 
         safe_log(f"[INFO] SWEEP done. Top list written: {top_path}")
+        safe_log("[DONE]")
+        return
+
+    # ----------------------------
+    # TEST ONLY MODE
+    # ----------------------------
+    if args.test_only:
+        (tr_s, tr_e), (va_s, va_e), (te_s, te_e) = time_split_indices(T, args.train_frac, args.val_frac)
+        safe_log(f"[INFO] time split: train=[{tr_s},{tr_e}] val=[{va_s},{va_e}] test=[{te_s},{te_e}]")
+
+        close_raw = X[:, :, close_idx].copy()
+
+        # normalization with train-only stats (same as training path)
+        X_train = X[:, tr_s:tr_e + 1, :]
+        M_train = M[:, tr_s:tr_e + 1, :]
+        mu, sig = masked_mean_std(X_train, M_train)
+        Xn = apply_masked_standardize(X, M, mu, sig)
+
+        # model path
+        model_path = args.model_path if args.model_path else os.path.join(args.outdir, "best_model.pt")
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Missing model checkpoint: {model_path}")
+
+        ckpt = torch.load(model_path, map_location=cfg.device)
+
+        # allow cfg override from checkpoint (important for lookback/horizon/model_type)
+        if isinstance(ckpt, dict) and "cfg" in ckpt:
+            for k, v in ckpt["cfg"].items():
+                if hasattr(cfg, k):
+                    setattr(cfg, k, v)
+
+        model = build_model(cfg, in_ch=2 * F).to(cfg.device)
+        model.load_state_dict(ckpt["model_state"] if isinstance(ckpt, dict) and "model_state" in ckpt else ckpt)
+
+        # threshold choice
+        thr = float(args.test_thr)
+        if thr < 0:
+            # prefer stored threshold if present
+            if isinstance(ckpt, dict) and "val_thr" in ckpt:
+                thr = float(ckpt["val_thr"])
+            else:
+                thr = 0.85  # fallback
+
+        logger.info(f"[TESTONLY] model={model_path} thr={thr:.3f} misc_dir={misc_dir}")
+
+        run_test_report(
+            model=model,
+            cfg=cfg,
+            Xn=Xn,
+            M=M,
+            assets=assets,
+            dates=dates,
+            close_raw=close_raw,
+            close_idx=close_idx,
+            te_s=te_s,
+            te_e=te_e,
+            report_base_dir=report_base,
+            misc_dir=misc_dir,
+            thr=thr,
+            logger=logger,
+            initial_cash=args.initial_cash,
+            trade_fee_eur=args.trade_fee_eur,
+            exec_delay_days=args.exec_delay_days,
+            hysteresis=args.hysteresis,
+        )
+
         safe_log("[DONE]")
         return
 
