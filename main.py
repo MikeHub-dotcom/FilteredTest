@@ -259,7 +259,9 @@ def run_single_training(
     """
     logger = setup_logger(outdir)
     logger.info(f"device={cfg.device}")
-    set_seed(int(cfg.seed_trials))
+    # IMPORTANT: use cfg.seed for model init / dataloader randomness
+    # cfg.seed_trials is reserved for dataset anchor subsampling reproducibility
+    set_seed(int(cfg.seed))
     torch.backends.cudnn.benchmark = bool(cfg.cudnn_benchmark)
     scaler = AmpGradScaler(amp_device_type(cfg.device), enabled=(cfg.amp and str(cfg.device).startswith("cuda")))
 
@@ -1358,6 +1360,10 @@ def main():
     ap.add_argument("--trials", type=int, default=48, help="Number of sweep trials")
     ap.add_argument("--sweep_epochs", type=int, default=2, help="Epochs per trial during sweep screening")
     ap.add_argument("--sweep_seed", type=int, default=1234, help="Base RNG seed for sweep sampling")
+    ap.add_argument("--sweep_repeats", type=int, default=1,
+                    help="Repeat each trial with different model seeds; aggregated ranking (robustness)")
+    ap.add_argument("--sweep_seed_stride", type=int, default=1000,
+                    help="Stride for deriving per-trial/per-repeat model seeds to avoid collisions")
     # ----------------------------
     # Train-from-trial (load cfg.json)
     # ----------------------------
@@ -1463,8 +1469,8 @@ def main():
         for trial in range(1, args.trials + 1):
             trial_cfg = sample_trial_cfg(base_cfg, rng)
             trial_cfg.epochs = int(args.sweep_epochs)
+            # keep dataset subsampling stable per trial
             trial_cfg.seed_trials = int(args.sweep_seed + trial)
-            trial_cfg.seed = trial_cfg.seed_trials
 
             tdir = make_trial_outdir(sweep_outdir, trial)
 
@@ -1472,46 +1478,82 @@ def main():
             with open(os.path.join(tdir, "cfg.json"), "w", encoding="utf-8") as f:
                 json.dump(asdict(trial_cfg), f, indent=2)
 
-            # run
-            t0 = time.time()
-            metrics = run_single_training(
-                cfg=trial_cfg, args=args, X=X, M=M,
-                assets=assets, dates=dates, feat_names=feat_names,
-                close_idx=close_idx, splits=splits, outdir=tdir
-            )
-            dt = time.time() - t0
+            # run repeats (robustness): vary cfg.seed, keep cfg.seed_trials fixed
+            rep_metrics = []
+            rep_times = []
+            for rep in range(int(args.sweep_repeats)):
+                rep_cfg = Config(**asdict(trial_cfg))  # shallow "clone" via dataclass dict
+                rep_cfg.seed = int(args.sweep_seed + trial * args.sweep_seed_stride + rep)
+
+                rep_out = os.path.join(tdir, f"rep_{rep:02d}")
+                os.makedirs(rep_out, exist_ok=True)
+
+                t0 = time.time()
+                metrics = run_single_training(
+                    cfg=rep_cfg, args=args, X=X, M=M,
+                    assets=assets, dates=dates, feat_names=feat_names,
+                    close_idx=close_idx, splits=splits, outdir=rep_out
+                )
+                dt = time.time() - t0
+                rep_times.append(dt)
+
+                # write per-repeat row
+                row_rep = {
+                    "trial": trial,
+                    "rep": rep,
+                    "time_s": round(dt, 2),
+                    **asdict(rep_cfg),
+                    **metrics,
+                }
+                write_jsonl(results_path, row_rep)
+                rep_metrics.append(metrics)
+
+            # aggregate for leaderboard ranking
+            vals = np.array([m["best_val_avg_rnet"] for m in rep_metrics], dtype=np.float64)
+            trades = np.array([m["best_val_trades"] for m in rep_metrics], dtype=np.float64)
+            bce = np.array([m["best_val_bce"] for m in rep_metrics], dtype=np.float64)
+            acc = np.array([m["best_val_acc"] for m in rep_metrics], dtype=np.float64)
+
+            agg = {
+                "best_val_avg_rnet_med": float(np.nanmedian(vals)),
+                "best_val_avg_rnet_mean": float(np.nanmean(vals)),
+                "best_val_trades_med": int(np.nanmedian(trades)),
+                "best_val_bce_mean": float(np.nanmean(bce)),
+                "best_val_acc_mean": float(np.nanmean(acc)),
+                "time_s_mean": float(np.mean(rep_times)) if rep_times else float("nan"),
+                "sweep_repeats": int(args.sweep_repeats),
+            }
 
             row = {
                 "trial": trial,
-                "time_s": round(dt, 2),
+                "time_s": round(agg["time_s_mean"], 2),
                 **asdict(trial_cfg),
-                **metrics,
+                **agg,
             }
-            write_jsonl(results_path, row)
-
             leaderboard.append(row)
 
             safe_log(
                 f"[SWEEP] trial={trial:04d} model={trial_cfg.model_type} "
-                f"avg_rnet={metrics['best_val_avg_rnet']:.6f} trades={metrics['best_val_trades']} "
-                f"thr={metrics['best_val_thr']:.3f} "
+                f"avg_rnet_med={row['best_val_avg_rnet_med']:.6f} avg_rnet_mean={row['best_val_avg_rnet_mean']:.6f} "
+                f"trades_med={row['best_val_trades_med']} repeats={row['sweep_repeats']} "
                 f"L={trial_cfg.lookback} H={trial_cfg.horizon} theta={trial_cfg.ignore_band_logret:.3f} "
                 f"lr={trial_cfg.lr:.1e} wd={trial_cfg.weight_decay:.1e} "
                 f"do={trial_cfg.dropout:.2f} tcn_do={trial_cfg.tcn_dropout:.2f} "
                 f"tcn(ch={trial_cfg.tcn_channels},lv={trial_cfg.tcn_levels},k={trial_cfg.tcn_kernel_size}) "
-                f"cost={trial_cfg.roundtrip_cost_bps:.0f}bps time={dt:.1f}s"
+                f"cost={trial_cfg.roundtrip_cost_bps:.0f}bps time~={row['time_s']:.1f}s"
             )
 
-        # sort by best_val_avg_rnet then trades
-        leaderboard.sort(key=lambda r: (r["best_val_avg_rnet"], r["best_val_trades"]), reverse=True)
+        # sort by robust metric first (median), then trades
+        leaderboard.sort(key=lambda r: (r["best_val_avg_rnet_med"], r["best_val_trades_med"]), reverse=True)
 
         top_path = os.path.join(sweep_outdir, "leaderboard_top.csv")
         with open(top_path, "w", encoding="utf-8") as f:
             cols = [
-                "trial", "model_type", "best_val_avg_rnet", "best_val_trades", "best_val_thr", "best_val_winrate",
+                "trial", "model_type",
+                "best_val_avg_rnet_med", "best_val_avg_rnet_mean", "best_val_trades_med", "sweep_repeats",
                 "lookback", "horizon", "ignore_band_logret", "lr", "weight_decay", "dropout",
                 "roundtrip_cost_bps", "batch_size", "max_anchors_train", "max_anchors_val",
-                "best_val_bce", "best_val_acc", "time_s"
+                "best_val_bce_mean", "best_val_acc_mean", "time_s"
             ]
             f.write(",".join(cols) + "\n")
             for r in leaderboard[:50]:
