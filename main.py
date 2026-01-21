@@ -137,6 +137,9 @@ class Config:
     num_workers: int = 0
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     seed: int = 42
+    # Early stopping (based on validation trading metric, not BCE)
+    early_stop_patience: int = 12  # epochs without improvement until stop; 0 disables
+    early_stop_min_epochs: int = 30  # don't stop before this epoch
     ignore_band_logret: float = 0.015  # 0.0 = deaktiviert
 
     # Cost model (very important for "profit probability")
@@ -1388,6 +1391,13 @@ def main():
     # ----------------------------
     ap.add_argument("--cfg", default="", help="Optional: path to a cfg.json from a sweep trial to override Config")
     ap.add_argument("--epochs", type=int, default=0, help="Optional: override cfg.epochs (useful for full training)")
+
+    # Full-train overrides (multi-seed + full(er) validation)
+    ap.add_argument("--seed", type=int, default=-1, help="Override cfg.seed (for multi-seed full training runs)")
+    ap.add_argument("--max_anchors_train", type=int, default=-1, help = "Override cfg.max_anchors_train (0 disables sampling, -1 keeps cfg)")
+    ap.add_argument("--max_anchors_val", type=int, default=-1, help = "Override cfg.max_anchors_val (0 disables sampling, -1 keeps cfg)")
+    ap.add_argument("--early_stop_patience", type=int, default=-1, help = "Override cfg.early_stop_patience (0 disables, -1 keeps cfg)")
+    ap.add_argument("--early_stop_min_epochs", type=int, default=-1,help = "Override cfg.early_stop_min_epochs (-1 keeps cfg)")
     # ----------------------------
     # TEST / REPORT MODE
     # ----------------------------
@@ -1427,6 +1437,22 @@ def main():
     # Optional: override epochs from CLI (takes precedence over cfg.json)
     if args.epochs and args.epochs > 0:
         cfg.epochs = int(args.epochs)
+
+    # Optional: override seed for multi-seed full training
+    if hasattr(args, "seed") and args.seed is not None and int(args.seed) >= 0:
+        cfg.seed = int(args.seed)
+
+    # Optional: override sampling anchors (0 disables sampling)
+    if hasattr(args, "max_anchors_train") and int(args.max_anchors_train) >= 0:
+        cfg.max_anchors_train = int(args.max_anchors_train)
+    if hasattr(args, "max_anchors_val") and int(args.max_anchors_val) >= 0:
+        cfg.max_anchors_val = int(args.max_anchors_val)
+
+    # Optional: override early stopping knobs
+    if hasattr(args, "early_stop_patience") and int(args.early_stop_patience) >= 0:
+        cfg.early_stop_patience = int(args.early_stop_patience)
+    if hasattr(args, "early_stop_min_epochs") and int(args.early_stop_min_epochs) >= 0:
+        cfg.early_stop_min_epochs = int(args.early_stop_min_epochs)
 
     set_seed(cfg.seed)
     os.makedirs(args.outdir, exist_ok=True)
@@ -1791,10 +1817,13 @@ def main():
 
     best_val_avg_rnet = -float("inf")
     best_path = os.path.join(args.outdir, "best_model.pt")
+    saved_any_ckpt = False
+    no_improve = 0
 
     logger.info("training start")
     for epoch in range(1, cfg.epochs + 1):
         ep_t0 = time.time()
+        improved = False
 
         tr_loss = train_one_epoch(
             model=model,
@@ -1859,26 +1888,62 @@ def main():
             f"epoch_time_s={ep_time:.1f}"
         )
 
-        # --- NEW: checkpoint by profitability proxy, not BCE ---
+        # Checkpoint by profitability proxy, not BCE ---
         if np.isfinite(val_avg_rnet) and val_trades >= cfg.min_trades_val and val_avg_rnet > best_val_avg_rnet:
             best_val_avg_rnet = val_avg_rnet
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state": model.state_dict(),
-                    "opt_state": opt.state_dict(),
-                    "val_thr": val_thr,
-                    "val_info": val_info,
-                    "cfg": asdict(cfg),
-                },
-                best_path,
-            )
+
+            ckpt_obj = {
+                "epoch": epoch,
+                "model_state": model.state_dict(),
+                "opt_state": opt.state_dict(),
+                "val_thr": float(val_thr),
+                "val_info": val_info,
+                "cfg": asdict(cfg),
+            }
+
+            tmp_path = best_path + ".tmp"
+            torch.save(ckpt_obj, tmp_path)
+            os.replace(tmp_path, best_path)  # atomic on POSIX/Windows
+            saved_any_ckpt = True
+
             logger.info(
                 f"[CKPT] saved {os.path.basename(best_path)} "
                 f"(best_val_avg_rnet={best_val_avg_rnet:.6f}, trades={val_trades}, thr={val_thr:.3f})"
             )
 
+        # --- Early stopping on validation trading metric (best_val_avg_rnet) ---
+        if cfg.early_stop_patience and cfg.early_stop_patience > 0:
+            if improved:
+                no_improve = 0
+            else:
+                no_improve += 1
+
+            if epoch >= int(cfg.early_stop_min_epochs) and no_improve >= int(cfg.early_stop_patience):
+                logger.info(
+                    f"[EARLY STOP] epoch={epoch} no_improve={no_improve} "
+                    f"best_val_avg_rnet={best_val_avg_rnet:.6f}"
+                )
+                break
+
         sched.step()
+
+        if not saved_any_ckpt:
+            logger.warning(
+                f"[CKPT] no checkpoint met profitability gate (min_trades_val={cfg.min_trades_val}). "
+                f"Saving last-epoch model as fallback to avoid missing best_model.pt."
+            )
+            ckpt_obj = {
+                "epoch": cfg.epochs,
+                "model_state": model.state_dict(),
+                "opt_state": opt.state_dict(),
+                "val_thr": float(val_thr),
+                "val_info": val_info,
+                "cfg": asdict(cfg),
+            }
+            tmp_path = best_path + ".tmp"
+            torch.save(ckpt_obj, tmp_path)
+            os.replace(tmp_path, best_path)
+            saved_any_ckpt = True
 
     safe_log(f"[INFO] best model saved: {best_path} (best_val_avg_rnet={best_val_avg_rnet:.6f})")
 
