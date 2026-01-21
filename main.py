@@ -183,10 +183,17 @@ def sample_trial_cfg(base: Config, rng: np.random.Generator) -> Config:
     # ----------------------------
     # 2) Signal / trading-relevant params
     # ----------------------------
-    cfg.horizon = int(rng.choice([3, 5, 10, 15]))
-    cfg.lookback = int(rng.choice([64, 96, 128, 192, 256, 256, 384]))
-    cfg.ignore_band_logret = float(rng.choice([0.005, 0.010, 0.015, 0.020, 0.025, 0.030]))
-    cfg.roundtrip_cost_bps = float(rng.choice([10.0, 20.0, 35.0, 50.0, 75.0]))
+    cfg.horizon = int(rng.choice([3, 5, 7, 10, 15, 20]))
+    cfg.lookback = int(rng.choice([
+        96, 128, 192, 256,
+        384, 384,
+        512, 512,
+        640,
+        768, 768,
+        1024
+    ]))
+    cfg.ignore_band_logret = float(rng.choice([0.004, 0.006, 0.008, 0.010, 0.012, 0.015, 0.020, 0.025, 0.030]))
+    cfg.roundtrip_cost_bps = float(rng.choice([5.0, 10.0, 15.0, 20.0, 35.0, 50.0, 75.0, 100.0]))
 
     # ----------------------------
     # 3) Optimization
@@ -209,9 +216,9 @@ def sample_trial_cfg(base: Config, rng: np.random.Generator) -> Config:
     # 5) TCN architecture params (if model_type=tcn)
     # ----------------------------
     # Receptive field grows with levels and dilation; these ranges are good for daily OHLCV
-    cfg.tcn_channels = int(rng.choice([128, 192, 256, 384]))
-    cfg.tcn_levels = int(rng.choice([4, 5, 6, 7]))
-    cfg.tcn_kernel_size = int(rng.choice([3, 5, 7]))
+    cfg.tcn_channels = int(rng.choice([128, 192, 256, 384, 512]))
+    cfg.tcn_levels = int(rng.choice([4, 5, 6, 7, 8, 9]))
+    cfg.tcn_kernel_size = int(rng.choice([3, 5, 7, 9]))
     cfg.tcn_use_groupnorm = True
 
     # ----------------------------
@@ -1364,6 +1371,18 @@ def main():
                     help="Repeat each trial with different model seeds; aggregated ranking (robustness)")
     ap.add_argument("--sweep_seed_stride", type=int, default=1000,
                     help="Stride for deriving per-trial/per-repeat model seeds to avoid collisions")
+    ap.add_argument("--sweep_two_stage", action="store_true",
+                    help="Two-stage sweep: cheap screening first, then train only top-K trials longer/more repeats.")
+    ap.add_argument("--sweep_stage1_epochs", type=int, default=1,
+                    help="Epochs for stage-1 screening (only if --sweep_two_stage).")
+    ap.add_argument("--sweep_stage1_repeats", type=int, default=1,
+                    help="Repeats for stage-1 screening (only if --sweep_two_stage).")
+    ap.add_argument("--sweep_stage2_topk", type=int, default=20,
+                    help="How many trials to keep for stage-2 (only if --sweep_two_stage).")
+    ap.add_argument("--sweep_stage2_epochs", type=int, default=3,
+                    help="Epochs for stage-2 (only if --sweep_two_stage).")
+    ap.add_argument("--sweep_stage2_repeats", type=int, default=3,
+                    help="Repeats for stage-2 (only if --sweep_two_stage).")
     # ----------------------------
     # Train-from-trial (load cfg.json)
     # ----------------------------
@@ -1466,26 +1485,16 @@ def main():
 
         leaderboard = []
 
-        for trial in range(1, args.trials + 1):
-            trial_cfg = sample_trial_cfg(base_cfg, rng)
-            trial_cfg.epochs = int(args.sweep_epochs)
-            # keep dataset subsampling stable per trial
-            trial_cfg.seed_trials = int(args.sweep_seed + trial)
-
-            tdir = make_trial_outdir(sweep_outdir, trial)
-
-            # log config for reproducibility
-            with open(os.path.join(tdir, "cfg.json"), "w", encoding="utf-8") as f:
-                json.dump(asdict(trial_cfg), f, indent=2)
-
-            # run repeats (robustness): vary cfg.seed, keep cfg.seed_trials fixed
+        def _run_repeats_for(cfg_base: Config, trial: int, tdir: str, repeats: int, epochs: int, stage: str):
             rep_metrics = []
             rep_times = []
-            for rep in range(int(args.sweep_repeats)):
-                rep_cfg = Config(**asdict(trial_cfg))  # shallow "clone" via dataclass dict
-                rep_cfg.seed = int(args.sweep_seed + trial * args.sweep_seed_stride + rep)
+            for rep in range(int(repeats)):
+                rep_cfg = Config(**asdict(cfg_base))
+                rep_cfg.epochs = int(epochs)
+                rep_cfg.seed = int(
+                    args.sweep_seed + trial * args.sweep_seed_stride + rep + (0 if stage == "stage1" else 100_000))
 
-                rep_out = os.path.join(tdir, f"rep_{rep:02d}")
+                rep_out = os.path.join(tdir, f"{stage}_rep_{rep:02d}")
                 os.makedirs(rep_out, exist_ok=True)
 
                 t0 = time.time()
@@ -1497,10 +1506,10 @@ def main():
                 dt = time.time() - t0
                 rep_times.append(dt)
 
-                # write per-repeat row
                 row_rep = {
                     "trial": trial,
                     "rep": rep,
+                    "stage": stage,
                     "time_s": round(dt, 2),
                     **asdict(rep_cfg),
                     **metrics,
@@ -1508,29 +1517,96 @@ def main():
                 write_jsonl(results_path, row_rep)
                 rep_metrics.append(metrics)
 
-            # aggregate for leaderboard ranking
+            return rep_metrics, rep_times
+
+        # ---------- Stage 1: cheap screening ----------
+        stage1_records = []  # (score, trial, trial_cfg, tdir)
+        for trial in range(1, args.trials + 1):
+            trial_cfg = sample_trial_cfg(base_cfg, rng)
+
+            # keep dataset subsampling stable per trial
+            trial_cfg.seed_trials = int(args.sweep_seed + trial)
+
+            tdir = make_trial_outdir(sweep_outdir, trial)
+            with open(os.path.join(tdir, "cfg.json"), "w", encoding="utf-8") as f:
+                json.dump(asdict(trial_cfg), f, indent=2)
+
+            if args.sweep_two_stage:
+                rep_metrics, rep_times = _run_repeats_for(
+                    cfg_base=trial_cfg,
+                    trial=trial,
+                    tdir=tdir,
+                    repeats=args.sweep_stage1_repeats,
+                    epochs=args.sweep_stage1_epochs,
+                    stage="stage1",
+                )
+            else:
+                # legacy behavior: directly run full sweep settings
+                rep_metrics, rep_times = _run_repeats_for(
+                    cfg_base=trial_cfg,
+                    trial=trial,
+                    tdir=tdir,
+                    repeats=args.sweep_repeats,
+                    epochs=args.sweep_epochs,
+                    stage="stage_full",
+                )
+
             vals = np.array([m["best_val_avg_rnet"] for m in rep_metrics], dtype=np.float64)
-            trades = np.array([m["best_val_trades"] for m in rep_metrics], dtype=np.float64)
-            bce = np.array([m["best_val_bce"] for m in rep_metrics], dtype=np.float64)
-            acc = np.array([m["best_val_acc"] for m in rep_metrics], dtype=np.float64)
+            score = float(np.nanmedian(vals)) if np.isfinite(np.nanmedian(vals)) else float("-inf")
+            stage1_records.append((score, trial, trial_cfg, tdir))
 
-            agg = {
-                "best_val_avg_rnet_med": float(np.nanmedian(vals)),
-                "best_val_avg_rnet_mean": float(np.nanmean(vals)),
-                "best_val_trades_med": int(np.nanmedian(trades)),
-                "best_val_bce_mean": float(np.nanmean(bce)),
-                "best_val_acc_mean": float(np.nanmean(acc)),
-                "time_s_mean": float(np.mean(rep_times)) if rep_times else float("nan"),
-                "sweep_repeats": int(args.sweep_repeats),
-            }
+            if not args.sweep_two_stage:
+                # also write leaderboard row now (single-stage)
+                trades = np.array([m["best_val_trades"] for m in rep_metrics], dtype=np.float64)
+                bce = np.array([m["best_val_bce"] for m in rep_metrics], dtype=np.float64)
+                acc = np.array([m["best_val_acc"] for m in rep_metrics], dtype=np.float64)
+                agg = {
+                    "best_val_avg_rnet_med": float(np.nanmedian(vals)),
+                    "best_val_avg_rnet_mean": float(np.nanmean(vals)),
+                    "best_val_trades_med": int(np.nanmedian(trades)),
+                    "best_val_bce_mean": float(np.nanmean(bce)),
+                    "best_val_acc_mean": float(np.nanmean(acc)),
+                    "time_s_mean": float(np.mean(rep_times)) if rep_times else float("nan"),
+                    "sweep_repeats": int(args.sweep_repeats),
+                }
+                row = {"trial": trial, "time_s": round(agg["time_s_mean"], 2), **asdict(trial_cfg), **agg}
+                leaderboard.append(row)
 
-            row = {
-                "trial": trial,
-                "time_s": round(agg["time_s_mean"], 2),
-                **asdict(trial_cfg),
-                **agg,
-            }
-            leaderboard.append(row)
+        # ---------- Stage 2: intensify only top-K ----------
+        if args.sweep_two_stage:
+            stage1_records.sort(key=lambda x: x[0], reverse=True)
+            topk = stage1_records[: int(args.sweep_stage2_topk)]
+            logger.info(f"[SWEEP] stage1 done -> stage2 on topK={len(topk)} (of {len(stage1_records)})")
+
+            for rank_i, (score1, trial, trial_cfg, tdir) in enumerate(topk, start=1):
+                rep_metrics, rep_times = _run_repeats_for(
+                    cfg_base=trial_cfg,
+                    trial=trial,
+                    tdir=tdir,
+                    repeats=args.sweep_stage2_repeats,
+                    epochs=args.sweep_stage2_epochs,
+                    stage="stage2",
+                )
+
+                vals = np.array([m["best_val_avg_rnet"] for m in rep_metrics], dtype=np.float64)
+                trades = np.array([m["best_val_trades"] for m in rep_metrics], dtype=np.float64)
+                bce = np.array([m["best_val_bce"] for m in rep_metrics], dtype=np.float64)
+                acc = np.array([m["best_val_acc"] for m in rep_metrics], dtype=np.float64)
+
+                agg = {
+                    "best_val_avg_rnet_med": float(np.nanmedian(vals)),
+                    "best_val_avg_rnet_mean": float(np.nanmean(vals)),
+                    "best_val_trades_med": int(np.nanmedian(trades)),
+                    "best_val_bce_mean": float(np.nanmean(bce)),
+                    "best_val_acc_mean": float(np.nanmean(acc)),
+                    "time_s_mean": float(np.mean(rep_times)) if rep_times else float("nan"),
+                    "sweep_repeats": int(args.sweep_stage2_repeats),
+                    "stage1_score_med": float(score1),
+                    "stage2_rank": int(rank_i),
+                }
+
+                row = {"trial": trial, "time_s": round(agg["time_s_mean"], 2), **asdict(trial_cfg), **agg}
+                leaderboard.append(row)
 
             safe_log(
                 f"[SWEEP] trial={trial:04d} model={trial_cfg.model_type} "
