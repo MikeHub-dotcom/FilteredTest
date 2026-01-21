@@ -147,8 +147,11 @@ class Config:
     roundtrip_cost_bps: float = 20.0  # 20 bps = 0.20% roundtrip
 
     # Validation threshold search
+    # Validation threshold search
     min_trades_val: int = 100
-    threshold_grid: int = 81  # number of thresholds between 0.5..0.9
+    threshold_grid: int = 81  # number of thresholds between thr_min..thr_max
+    thr_min: float = 0.50
+    thr_max: float = 0.99
 
     # Fast sweep / screening
     max_anchors_train: int = 1_500_000  # set 0 to disable
@@ -236,6 +239,13 @@ def sample_trial_cfg(base: Config, rng: np.random.Generator) -> Config:
     cfg.epochs = 2  # overwritten by args.sweep_epochs at runtime
     cfg.max_anchors_train = int(rng.choice([800_000, 1_200_000, 1_500_000, 2_000_000]))
     cfg.max_anchors_val = int(rng.choice([300_000, 450_000, 600_000, 900_000]))
+
+    # OOM Guardrail
+    # Guard rails: avoid pathological (lookback, batch) combos causing OOM
+    if cfg.lookback >= 512:
+        cfg.batch_size = int(min(cfg.batch_size, 256))
+    if cfg.lookback >= 768:
+        cfg.batch_size = int(min(cfg.batch_size, 128))
 
     return cfg
 
@@ -337,7 +347,7 @@ def run_single_training(
         )
         val_metrics = evaluate_classifier(model, val_loader, cfg.device)
 
-        thresholds = np.linspace(0.50, 0.90, cfg.threshold_grid, dtype=np.float32)
+        thresholds = np.linspace(cfg.thr_min, cfg.thr_max, cfg.threshold_grid, dtype=np.float32)
         val_thr, val_info = threshold_search_for_profitability(
             model=model, dataset=val_ds, device=cfg.device,
             thresholds=thresholds, min_trades=cfg.min_trades_val
@@ -1411,6 +1421,10 @@ def main():
                     help="Project misc dir containing TR_Stocks_*.csv and TR_ETFs_*.csv. If empty, uses <project_root>/misc")
     ap.add_argument("--test_thr", type=float, default=-1.0,
                     help="Decision threshold for trading. If <0, uses checkpoint val_thr or re-optimizes on val.")
+    ap.add_argument("--thr_min", type=float, default=-1.0, help="Override cfg.thr_min (threshold search min)")
+    ap.add_argument("--thr_max", type=float, default=-1.0, help="Override cfg.thr_max (threshold search max)")
+    ap.add_argument("--min_trades_val", type=int, default=-1,
+                    help="Override cfg.min_trades_val (validation min trades)")
     ap.add_argument("--initial_cash", type=float, default=10_000.0,
                     help="Initial cash per-asset simulation (independent).")
     ap.add_argument("--trade_fee_eur", type=float, default=1.0,
@@ -1453,6 +1467,14 @@ def main():
         cfg.early_stop_patience = int(args.early_stop_patience)
     if hasattr(args, "early_stop_min_epochs") and int(args.early_stop_min_epochs) >= 0:
         cfg.early_stop_min_epochs = int(args.early_stop_min_epochs)
+
+    # Thresholds
+    if hasattr(args, "thr_min") and float(args.thr_min) >= 0:
+        cfg.thr_min = float(args.thr_min)
+    if hasattr(args, "thr_max") and float(args.thr_max) >= 0:
+        cfg.thr_max = float(args.thr_max)
+    if hasattr(args, "min_trades_val") and int(args.min_trades_val) >= 0:
+        cfg.min_trades_val = int(args.min_trades_val)
 
     set_seed(cfg.seed)
     os.makedirs(args.outdir, exist_ok=True)
@@ -1524,11 +1546,29 @@ def main():
                 os.makedirs(rep_out, exist_ok=True)
 
                 t0 = time.time()
-                metrics = run_single_training(
-                    cfg=rep_cfg, args=args, X=X, M=M,
-                    assets=assets, dates=dates, feat_names=feat_names,
-                    close_idx=close_idx, splits=splits, outdir=rep_out
-                )
+                try:
+                    metrics = run_single_training(
+                        cfg=rep_cfg, args=args, X=X, M=M,
+                        assets=assets, dates=dates, feat_names=feat_names,
+                        close_idx=close_idx, splits=splits, outdir=rep_out
+                    )
+                except RuntimeError as e:
+                    msg = str(e).lower()
+                    if "out of memory" in msg or "cuda" in msg and "memory" in msg:
+                        # mark trial as failed but keep sweep running
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        metrics = {
+                            "best_val_avg_rnet": float("nan"),
+                            "best_val_thr": float("nan"),
+                            "best_val_trades": 0,
+                            "best_val_bce": float("nan"),
+                            "best_val_acc": float("nan"),
+                        }
+                        logger.exception(f"[SWEEP] OOM in trial={trial} rep={rep} stage={stage} -> skipping")
+                    else:
+                        raise
+
                 dt = time.time() - t0
                 rep_times.append(dt)
 
@@ -1841,7 +1881,7 @@ def main():
         val_metrics = evaluate_classifier(model, val_loader, cfg.device)
 
         # --- NEW: profit-oriented validation metrics (do NOT rely on BCE/acc for trading) ---
-        thresholds = np.linspace(0.50, 0.90, cfg.threshold_grid, dtype=np.float32)
+        thresholds = np.linspace(cfg.thr_min, cfg.thr_max, cfg.threshold_grid, dtype=np.float32)
         val_thr, val_info = threshold_search_for_profitability(
             model=model,
             dataset=val_ds,
@@ -1952,7 +1992,7 @@ def main():
     model.load_state_dict(ckpt["model_state"])
 
     # Threshold optimization to maximize profit probability among taken trades
-    thresholds = np.linspace(0.50, 0.90, cfg.threshold_grid, dtype=np.float32)
+    thresholds = np.linspace(cfg.thr_min, cfg.thr_max, cfg.threshold_grid, dtype=np.float32)
     thr, info = threshold_search_for_profitability(
         model=model,
         dataset=val_ds,
