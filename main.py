@@ -183,34 +183,34 @@ def sample_trial_cfg(base: Config, rng: np.random.Generator) -> Config:
     # ----------------------------
     # 2) Signal / trading-relevant params
     # ----------------------------
-    cfg.horizon = int(rng.choice([3, 5, 10]))             # aligns with 2-3 trades/week (esp. with ignore band + high thr)
-    cfg.lookback = int(rng.choice([64, 96, 128, 192]))    # longer lookback helps regime/noise smoothing
-    cfg.ignore_band_logret = float(rng.choice([0.010, 0.015, 0.020, 0.025]))
-    cfg.roundtrip_cost_bps = float(rng.choice([20.0, 35.0, 50.0]))
+    cfg.horizon = int(rng.choice([3, 5, 10, 15]))
+    cfg.lookback = int(rng.choice([64, 96, 128, 192, 256, 256, 384]))
+    cfg.ignore_band_logret = float(rng.choice([0.005, 0.010, 0.015, 0.020, 0.025, 0.030]))
+    cfg.roundtrip_cost_bps = float(rng.choice([10.0, 20.0, 35.0, 50.0, 75.0]))
 
     # ----------------------------
     # 3) Optimization
     # ----------------------------
     # TCN tolerates a bit higher LR than transformer-like models; keep conservative set
-    cfg.lr = float(rng.choice([3e-4, 5e-4, 8e-4, 1.2e-3]))
-    cfg.weight_decay = float(rng.choice([1e-5, 1e-4, 5e-4]))
-    cfg.grad_clip = float(rng.choice([0.5, 1.0, 2.0]))
+    cfg.lr = float(rng.choice([2e-4, 3e-4, 5e-4, 8e-4, 1.2e-3, 1.6e-3]))
+    cfg.weight_decay = float(rng.choice([0.0, 1e-6, 1e-5, 1e-4, 5e-4, 1e-3]))
+    cfg.grad_clip = float(rng.choice([0.5, 1.0, 2.0, 5.0]))
 
     # Batch (4090 friendly); keep not too large to avoid dataloader overhead
-    cfg.batch_size = int(rng.choice([512, 768, 1024]))
+    cfg.batch_size = int(rng.choice([256, 512, 768, 1024]))
 
     # ----------------------------
     # 4) Model regularization
     # ----------------------------
-    cfg.dropout = float(rng.choice([0.05, 0.10, 0.20]))  # used by CNN head
-    cfg.tcn_dropout = float(rng.choice([0.05, 0.10, 0.20]))
+    cfg.dropout = float(rng.choice([0.00, 0.05, 0.10, 0.20, 0.30]))  # used by CNN head
+    cfg.tcn_dropout = float(rng.choice([0.00, 0.05, 0.10, 0.15, 0.20, 0.30]))
 
     # ----------------------------
     # 5) TCN architecture params (if model_type=tcn)
     # ----------------------------
     # Receptive field grows with levels and dilation; these ranges are good for daily OHLCV
-    cfg.tcn_channels = int(rng.choice([128, 192, 256]))
-    cfg.tcn_levels = int(rng.choice([4, 5, 6]))          # 1+2+4+8+... -> long effective memory
+    cfg.tcn_channels = int(rng.choice([128, 192, 256, 384]))
+    cfg.tcn_levels = int(rng.choice([4, 5, 6, 7]))
     cfg.tcn_kernel_size = int(rng.choice([3, 5, 7]))
     cfg.tcn_use_groupnorm = True
 
@@ -224,8 +224,8 @@ def sample_trial_cfg(base: Config, rng: np.random.Generator) -> Config:
     # 7) Sweep speed (screening)
     # ----------------------------
     cfg.epochs = 2  # overwritten by args.sweep_epochs at runtime
-    cfg.max_anchors_train = int(rng.choice([800_000, 1_200_000, 1_500_000]))
-    cfg.max_anchors_val = int(rng.choice([300_000, 450_000, 600_000]))
+    cfg.max_anchors_train = int(rng.choice([800_000, 1_200_000, 1_500_000, 2_000_000]))
+    cfg.max_anchors_val = int(rng.choice([300_000, 450_000, 600_000, 900_000]))
 
     return cfg
 
