@@ -261,6 +261,43 @@ def write_jsonl(path: str, row: dict) -> None:
         f.write(json.dumps(row) + "\n")
 
 
+def load_existing_sweep_results(results_path: str):
+    """
+    Parse existing sweep results.jsonl and return:
+      completed: set of (trial:int, stage:str, rep:int) that already exist
+      by_key: dict[(trial,stage,rep)] -> row (full dict), used to reuse metrics/time
+    Safe for partial/corrupt last line.
+    """
+    completed = set()
+    by_key = {}
+    if not results_path or not os.path.exists(results_path):
+        return completed, by_key
+
+    with open(results_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except Exception:
+                # tolerate partial last line after crash/reboot
+                continue
+
+            if "trial" not in row or "stage" not in row or "rep" not in row:
+                continue
+
+            try:
+                k = (int(row["trial"]), str(row["stage"]), int(row["rep"]))
+            except Exception:
+                continue
+
+            completed.add(k)
+            by_key[k] = row
+
+    return completed, by_key
+
+
 def run_single_training(
     cfg: Config,
     args,
@@ -1384,6 +1421,15 @@ def main():
                     help="Repeat each trial with different model seeds; aggregated ranking (robustness)")
     ap.add_argument("--sweep_seed_stride", type=int, default=1000,
                     help="Stride for deriving per-trial/per-repeat model seeds to avoid collisions")
+    ap.add_argument(
+        "--resume_sweep_dir",
+        default="",
+        help=(
+            "Resume an interrupted sweep. Provide either the run outdir (containing 'sweep/') "
+            "or the sweep folder itself. Already completed (trial,stage,rep) entries in results.jsonl "
+            "will be skipped."
+        ),
+    )
     ap.add_argument("--sweep_two_stage", action="store_true",
                     help="Two-stage sweep: cheap screening first, then train only top-K trials longer/more repeats.")
     ap.add_argument("--sweep_stage1_epochs", type=int, default=1,
@@ -1525,18 +1571,55 @@ def main():
         (tr_s, tr_e), (va_s, va_e), (te_s, te_e) = time_split_indices(T, args.train_frac, args.val_frac)
         splits = ((tr_s, tr_e), (va_s, va_e), (te_s, te_e))
 
-        sweep_outdir = os.path.join(args.outdir, "sweep")
+        # --- NEW: resume support ---
+        # If --resume_sweep_dir is provided, it can point to:
+        #   - the run outdir (contains "sweep/") OR
+        #   - the sweep folder itself
+        if args.resume_sweep_dir:
+            r = Path(args.resume_sweep_dir).resolve()
+            if r.name.lower() == "sweep":
+                sweep_outdir = str(r)
+            else:
+                sweep_outdir = str(r / "sweep")
+        else:
+            sweep_outdir = os.path.join(args.outdir, "sweep")
+
         os.makedirs(sweep_outdir, exist_ok=True)
         results_path = os.path.join(sweep_outdir, "results.jsonl")
+
+        completed_keys, existing_rows = load_existing_sweep_results(results_path)
+        if args.resume_sweep_dir:
+            logger.info(
+                f"[SWEEP][RESUME] sweep_outdir={sweep_outdir} "
+                f"existing_entries={len(completed_keys)}"
+            )
 
         safe_log(f"[INFO] SWEEP start: trials={args.trials} sweep_epochs={args.sweep_epochs} out={sweep_outdir}")
 
         leaderboard = []
 
-        def _run_repeats_for(cfg_base: Config, trial: int, tdir: str, repeats: int, epochs: int, stage: str):
+        def _run_repeats_for(cfg_base: Config, trial: int, tdir: str, repeats: int, epochs: int, stage: str,
+                             completed_keys: set, existing_rows: dict):
             rep_metrics = []
             rep_times = []
             for rep in range(int(repeats)):
+                k = (int(trial), str(stage), int(rep))
+                if k in completed_keys and k in existing_rows:
+                    # reuse existing metrics; do NOT append duplicate jsonl rows
+                    row0 = existing_rows[k]
+                    metrics0 = {
+                        "best_val_avg_rnet": float(row0.get("best_val_avg_rnet", float("nan"))),
+                        "best_val_thr": float(row0.get("best_val_thr", float("nan"))),
+                        "best_val_trades": int(row0.get("best_val_trades", 0)),
+                        "best_val_winrate": float(row0.get("best_val_winrate", float("nan"))),
+                        "best_val_score": float(row0.get("best_val_score", float("nan"))),
+                        "best_val_bce": float(row0.get("best_val_bce", float("nan"))),
+                        "best_val_acc": float(row0.get("best_val_acc", float("nan"))),
+                    }
+                    rep_metrics.append(metrics0)
+                    rep_times.append(float(row0.get("time_s", float("nan"))))
+                    continue
+
                 rep_cfg = Config(**asdict(cfg_base))
                 rep_cfg.epochs = int(epochs)
                 rep_cfg.seed = int(
@@ -1581,6 +1664,8 @@ def main():
                     **metrics,
                 }
                 write_jsonl(results_path, row_rep)
+                completed_keys.add(k)
+                existing_rows[k] = row_rep
                 rep_metrics.append(metrics)
 
             return rep_metrics, rep_times
@@ -1588,14 +1673,22 @@ def main():
         # ---------- Stage 1: cheap screening ----------
         stage1_records = []  # (score, trial, trial_cfg, tdir)
         for trial in range(1, args.trials + 1):
-            trial_cfg = sample_trial_cfg(base_cfg, rng)
-
-            # keep dataset subsampling stable per trial
-            trial_cfg.seed_trials = int(args.sweep_seed + trial)
-
             tdir = make_trial_outdir(sweep_outdir, trial)
-            with open(os.path.join(tdir, "cfg.json"), "w", encoding="utf-8") as f:
-                json.dump(asdict(trial_cfg), f, indent=2)
+
+            # If cfg.json exists, always use it (keeps backward compatibility for already-sampled trials)
+            cfg_path = os.path.join(tdir, "cfg.json")
+            if os.path.exists(cfg_path):
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    d = json.load(f)
+                trial_cfg = Config(**d)
+            else:
+                # Deterministic per-trial RNG: allows resume even if process restarts mid-sweep
+                rng_trial = np.random.default_rng(int(args.sweep_seed + trial))
+                trial_cfg = sample_trial_cfg(base_cfg, rng_trial)
+                with open(cfg_path, "w", encoding="utf-8") as f:
+                    json.dump(asdict(trial_cfg), f, indent=2)
+
+            trial_cfg.seed_trials = int(args.sweep_seed + trial)
 
             if args.sweep_two_stage:
                 rep_metrics, rep_times = _run_repeats_for(
@@ -1605,6 +1698,8 @@ def main():
                     repeats=args.sweep_stage1_repeats,
                     epochs=args.sweep_stage1_epochs,
                     stage="stage1",
+                    completed_keys=completed_keys,
+                    existing_rows=existing_rows,
                 )
             else:
                 # legacy behavior: directly run full sweep settings
@@ -1615,6 +1710,8 @@ def main():
                     repeats=args.sweep_repeats,
                     epochs=args.sweep_epochs,
                     stage="stage_full",
+                    completed_keys=completed_keys,
+                    existing_rows=existing_rows,
                 )
 
             vals = np.array([m["best_val_avg_rnet"] for m in rep_metrics], dtype=np.float64)
