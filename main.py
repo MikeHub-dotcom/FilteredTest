@@ -38,6 +38,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 # --- AMP compatibility (PyTorch >= 2.0 prefers torch.amp.*) ---
@@ -172,6 +173,21 @@ class Config:
     tcn_kernel_size: int = 5       # 3/5/7
     tcn_dropout: float = 0.10      # separate dropout for TCN (often works better than sharing cfg.dropout)
     tcn_use_groupnorm: bool = True # GN tends to be stable with large batch / non-stationary signals
+
+    # --- PatchTST (patched Transformer for time series) ---
+    # Patch along time axis -> Transformer encoder -> CLS head
+    patch_len: int = 32            # patch length along time axis
+    patch_stride: int = 16         # stride between patches (<= patch_len)
+    d_model: int = 256             # token embedding dimension
+    nhead: int = 8                 # attention heads
+    num_layers: int = 4            # Transformer encoder layers
+    dim_feedforward: int = 1024    # FFN hidden dim
+    norm_first: bool = True        # Pre-LN tends to be stabler
+
+    # --- iTransformer (Inverted Transformer: Tokens=Variablen) ---
+    itr_use_cls: bool = True  # CLS-Token statt Pooling
+    itr_pool: str = "mean"  # falls itr_use_cls=False: "mean" | "max"
+
 
 
 def sample_trial_cfg(base: Config, rng: np.random.Generator) -> Config:
@@ -692,6 +708,212 @@ class TCNModel(nn.Module):
         return self.head(z)
 
 
+class PatchTSTModel(nn.Module):
+    """
+    PatchTST-style Transformer encoder over time patches.
+
+    Input: x of shape (B, C, L) with C=features (+mask channel if enabled).
+    Output: logits of shape (B, 1)
+    """
+
+    def __init__(
+        self,
+        in_ch: int,
+        lookback: int,
+        patch_len: int,
+        patch_stride: int,
+        d_model: int,
+        nhead: int,
+        num_layers: int,
+        dim_feedforward: int,
+        dropout: float,
+        norm_first: bool = True,
+    ):
+        super().__init__()
+        self.in_ch = int(in_ch)
+        self.lookback = int(lookback)
+        self.patch_len = int(patch_len)
+        self.patch_stride = int(patch_stride)
+
+        if self.patch_len <= 0:
+            raise ValueError("patch_len must be > 0")
+        if self.patch_stride <= 0:
+            raise ValueError("patch_stride must be > 0")
+        if self.patch_stride > self.patch_len:
+            raise ValueError("patch_stride must be <= patch_len")
+
+        # number of patches for the configured lookback (pad if needed)
+        if self.lookback < self.patch_len:
+            self.n_patches = 1
+        else:
+            self.n_patches = 1 + (self.lookback - self.patch_len) // self.patch_stride
+
+        self.token_dim = self.in_ch * self.patch_len
+        self.proj = nn.Linear(self.token_dim, d_model)
+
+        # CLS token + positional embedding
+        self.cls = nn.Parameter(torch.zeros(1, 1, d_model))
+        self.pos = nn.Parameter(torch.zeros(1, 1 + self.n_patches, d_model))
+        nn.init.trunc_normal_(self.pos, std=0.02)
+        nn.init.trunc_normal_(self.cls, std=0.02)
+
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=norm_first,
+        )
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(d_model)
+        self.head = nn.Linear(d_model, 1)
+
+    def _make_patches(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B, C, L) -> patches: (B, N, C*patch_len)
+        Pads on the right so that we can extract the last patch cleanly.
+        """
+        B, C, L = x.shape
+        if L < self.patch_len:
+            pad = self.patch_len - L
+            x = F.pad(x, (0, pad))
+            L = x.shape[-1]
+
+        # ensure enough length to cover n_patches with stride
+        last_start = (self.n_patches - 1) * self.patch_stride
+        need_L = last_start + self.patch_len
+        if L < need_L:
+            x = F.pad(x, (0, need_L - L))
+            L = x.shape[-1]
+
+        patches = []
+        for i in range(self.n_patches):
+            s = i * self.patch_stride
+            e = s + self.patch_len
+            p = x[:, :, s:e]                 # (B, C, patch_len)
+            patches.append(p.reshape(B, -1)) # (B, C*patch_len)
+        return torch.stack(patches, dim=1)   # (B, N, token_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, C, L)
+        patches = self._make_patches(x)              # (B, N, token_dim)
+        z = self.proj(patches)                       # (B, N, d_model)
+
+        cls = self.cls.expand(z.size(0), -1, -1)     # (B, 1, d_model)
+        z = torch.cat([cls, z], dim=1)               # (B, 1+N, d_model)
+        z = z + self.pos[:, : z.shape[1], :]
+        z = self.dropout(z)
+        z = self.encoder(z)
+        z = self.norm(z)
+        cls_out = z[:, 0, :]
+        return self.head(cls_out)
+
+
+class ITransformerModel(nn.Module):
+    """
+    iTransformer (inverted): Tokens sind Variablen/Features (C Tokens),
+    jede Variable wird durch ihre Lookback-Historie (L) via Linear(L->d_model)
+    eingebettet. Danach Transformer-Encoder über Variablen.
+    Output: Logit pro Sample (Binary-Decision).
+    """
+    def __init__(self, in_ch: int, lookback: int, cfg: "Config"):
+        super().__init__()
+        self.in_ch = int(in_ch)
+        self.lookback = int(lookback)
+        self.d_model = int(cfg.d_model)
+
+        # Projektion der Zeitachse pro Variable: (B,C,L) -> (B,C,d_model)
+        self.var_proj = nn.Linear(self.lookback, self.d_model)
+
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=self.d_model,
+            nhead=int(cfg.nhead),
+            dim_feedforward=int(cfg.dim_feedforward),
+            dropout=float(cfg.dropout),
+            batch_first=True,
+            norm_first=bool(cfg.norm_first),
+            activation="gelu",
+        )
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=int(cfg.num_layers))
+        self.norm = nn.LayerNorm(self.d_model)
+
+        self.use_cls = bool(getattr(cfg, "itr_use_cls", True))
+        self.pool = str(getattr(cfg, "itr_pool", "mean")).lower()
+
+        if self.use_cls:
+            self.cls = nn.Parameter(torch.zeros(1, 1, self.d_model))
+            tok_count = self.in_ch + 1
+        else:
+            self.cls = None
+            tok_count = self.in_ch
+
+        # Positions/Token-Embedding über Variablen (nicht über Zeit)
+        self.pos = nn.Parameter(torch.zeros(1, tok_count, self.d_model))
+        self.dropout = nn.Dropout(float(cfg.dropout))
+
+        # Head
+        self.head = nn.Sequential(
+            nn.Linear(self.d_model, self.d_model),
+            nn.GELU(),
+            nn.Dropout(float(cfg.dropout)),
+            nn.Linear(self.d_model, 1),
+        )
+
+        nn.init.normal_(self.pos, mean=0.0, std=0.02)
+        if self.cls is not None:
+            nn.init.normal_(self.cls, mean=0.0, std=0.02)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, C, L)
+        if x.dim() != 3:
+            raise ValueError(f"expected x shape (B,C,L), got {tuple(x.shape)}")
+
+        B, C, L = x.shape
+        if C != self.in_ch:
+            # robust, aber eigentlich sollte C konstant sein
+            if C > self.in_ch:
+                x = x[:, : self.in_ch, :]
+                C = self.in_ch
+            else:
+                pad_c = self.in_ch - C
+                x = torch.cat([x, x.new_zeros((B, pad_c, L))], dim=1)
+                C = self.in_ch
+
+        # Lookback auf exakt self.lookback bringen (truncate left / pad left)
+        if L != self.lookback:
+            if L > self.lookback:
+                x = x[:, :, -self.lookback :]
+            else:
+                x = F.pad(x, (self.lookback - L, 0))
+
+        # Variable-Tokens erzeugen
+        z = self.var_proj(x)  # (B, C, d_model)
+
+        if self.use_cls:
+            cls = self.cls.expand(B, -1, -1)  # (B,1,d_model)
+            z = torch.cat([cls, z], dim=1)   # (B,1+C,d_model)
+
+        z = z + self.pos[:, : z.size(1), :]
+        z = self.dropout(z)
+
+        z = self.encoder(z)
+        z = self.norm(z)
+
+        if self.use_cls:
+            h = z[:, 0, :]
+        else:
+            if self.pool == "max":
+                h = z.max(dim=1).values
+            else:
+                h = z.mean(dim=1)
+
+        return self.head(h)
+
+
+
 def build_model(cfg: Config, in_ch: int) -> nn.Module:
     mt = str(cfg.model_type).lower().strip()
     if mt == "cnn":
@@ -705,7 +927,26 @@ def build_model(cfg: Config, in_ch: int) -> nn.Module:
             dropout=float(cfg.tcn_dropout),
             use_groupnorm=bool(cfg.tcn_use_groupnorm),
         )
-    raise ValueError(f"Unknown model_type='{cfg.model_type}'. Use 'cnn' or 'tcn'.")
+    if mt == "patchtst":
+        return PatchTSTModel(
+            in_ch=in_ch,
+            lookback=int(cfg.lookback),
+            patch_len=int(cfg.patch_len),
+            patch_stride=int(cfg.patch_stride),
+            d_model=int(cfg.d_model),
+            nhead=int(cfg.nhead),
+            num_layers=int(cfg.num_layers),
+            dim_feedforward=int(cfg.dim_feedforward),
+            dropout=float(cfg.dropout),
+            norm_first=bool(cfg.norm_first),
+        )
+    if mt in ("itransformer", "itr", "i_transformer"):
+        return ITransformerModel(
+            in_ch=in_ch,
+            lookback=int(cfg.lookback),
+            cfg=cfg,
+        )
+    raise ValueError(f"Unknown model_type='{cfg.model_type}'. Use 'cnn' or 'tcn', 'patchtst' or 'itransformer'.")
 
 
 # ----------------------------
