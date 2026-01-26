@@ -1840,9 +1840,13 @@ def main():
         leaderboard = []
 
         def _run_repeats_for(cfg_base: Config, trial: int, tdir: str, repeats: int, epochs: int, stage: str,
-                             completed_keys: set, existing_rows: dict):
+                             completed_keys: set | None = None, existing_rows: dict | None = None):
             rep_metrics = []
             rep_times = []
+            if completed_keys is None:
+                completed_keys = set()
+            if existing_rows is None:
+                existing_rows = {}
             for rep in range(int(repeats)):
                 k = (int(trial), str(stage), int(rep))
                 if k in completed_keys and k in existing_rows:
