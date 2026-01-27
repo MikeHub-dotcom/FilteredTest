@@ -19,6 +19,7 @@ Core idea:
 Dependencies:
   pip install numpy pandas torch
 """
+import copy
 from datetime import datetime
 import pandas as pd
 import matplotlib
@@ -190,7 +191,7 @@ class Config:
 
 
 
-def sample_trial_cfg(base: Config, rng: np.random.Generator) -> Config:
+def sample_trial_cfg_tcn(base: Config, rng: np.random.Generator) -> Config:
     """
     Architektur- und signal-fokussierter Sweep für Finanzdaten.
     Ziel: robuste Generalisierung + sinnvolle Trade-Frequenz.
@@ -264,6 +265,57 @@ def sample_trial_cfg(base: Config, rng: np.random.Generator) -> Config:
         cfg.batch_size = int(min(cfg.batch_size, 128))
 
     return cfg
+
+
+def sample_trial_cfg(base_cfg: Config, rng: np.random.Generator, sweep_arch: str = "mix") -> Config:
+    cfg = copy.deepcopy(base_cfg)
+
+    # ---- shared / training ----
+    cfg.lr = float(10 ** rng.uniform(-4.6, -3.0))                 # ~2.5e-5 .. 1e-3
+    cfg.weight_decay = float(10 ** rng.uniform(-8.0, -3.8))       # very small .. moderate
+    cfg.dropout = float(rng.uniform(0.00, 0.25))
+    cfg.label_smooth = float(rng.uniform(0.00, 0.10))
+
+    # Open lookback (previous sweep dominated by max -> open upward)
+    cfg.lookback = int(rng.choice([256, 384, 512, 768, 1024, 1536, 2048]))
+
+    # anchors (keep, but avoid extreme tiny values)
+    cfg.max_anchors_train = int(rng.choice([4000, 8000, 12000, 20000, 0]))
+    cfg.max_anchors_val   = int(rng.choice([4000, 8000, 12000, 0]))
+
+    # ---- choose architecture family ----
+    if sweep_arch == "patchtst":
+        cfg.model_type = "patchtst"
+    elif sweep_arch == "itransformer":
+        cfg.model_type = "itransformer"
+    else:
+        cfg.model_type = str(rng.choice(["patchtst", "itransformer"]))
+
+    # ---- PatchTST search space ----
+    if cfg.model_type == "patchtst":
+        cfg.patch_len = int(rng.choice([8, 16, 32, 64]))
+        cfg.patch_stride = int(rng.choice([cfg.patch_len // 2, cfg.patch_len]))  # 50% overlap or none
+
+        cfg.tr_d_model = int(rng.choice([64, 96, 128, 192, 256]))
+        cfg.tr_n_heads = int(rng.choice([4, 8]))
+        cfg.tr_n_layers = int(rng.choice([2, 3, 4, 5, 6]))
+        cfg.tr_ff_mult = int(rng.choice([2, 4, 6]))
+        cfg.tr_dropout = float(rng.uniform(0.00, 0.25))
+        cfg.tr_attn_dropout = float(rng.uniform(0.00, 0.20))
+
+    # ---- iTransformer search space ----
+    else:  # itransformer
+        cfg.tr_d_model = int(rng.choice([64, 96, 128, 192, 256]))
+        cfg.tr_n_heads = int(rng.choice([4, 8]))
+        cfg.tr_n_layers = int(rng.choice([2, 3, 4, 6, 8]))
+        cfg.tr_ff_mult = int(rng.choice([2, 4, 6]))
+        cfg.tr_dropout = float(rng.uniform(0.00, 0.25))
+        cfg.tr_attn_dropout = float(rng.uniform(0.00, 0.20))
+
+        # no patching here (inverted tokens); keep patch params default/unused
+
+    return cfg
+
 
 
 def make_trial_outdir(base_outdir: str, trial_id: int) -> str:
