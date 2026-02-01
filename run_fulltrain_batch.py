@@ -136,21 +136,16 @@ def run_one(
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default="runs_tcn_sweep_robust")
-    ap.add_argument("--dataset", default="dataset/dataset_2026-01-13_masked.npy")
-    ap.add_argument("--mask", default="dataset/mask_2026-01-13_masked.npy")
-    ap.add_argument("--assets", default="dataset/assets_2026-01-13.txt")
-    ap.add_argument("--dates", default="dataset/dates_2026-01-13.txt")
-    ap.add_argument("--features", default="dataset/features_2026-01-13.json")
+    ap.add_argument("--dataset", default="dataset/dataset_2026-02-01_masked.npy")
+    ap.add_argument("--mask", default="dataset/mask_2026-02-01_masked.npy")
+    ap.add_argument("--assets", default="dataset/assets_2026-02-01.txt")
+    ap.add_argument("--dates", default="dataset/dates_2026-02-01.txt")
+    ap.add_argument("--features", default="dataset/features_2026-02-01.json")
 
-    ap.add_argument("--trials", default="107,76,36,111")
     ap.add_argument("--seeds", default="20260121,20261121,20262121")
     ap.add_argument("--epochs", type=int, default=120)
 
-    # --- Proposed workflow: Trial 107 only ---
     ap.add_argument("--trials", default="107")
-    # screening defaults to 2 seeds; full defaults to 5 seeds (see --mode)
-    ap.add_argument("--seeds", default="20260121,20261121")
-    ap.add_argument("--epochs", type=int, default=50, help="Epochs per run (screening default ~40% of full).")
 
     ap.add_argument("--mode", choices=["screening", "full"], default="screening",
                     help="screening: 2 seeds, shorter training; full: 5 seeds, longer training.")
@@ -162,8 +157,6 @@ def main() -> None:
     ap.add_argument("--max_anchors_val", type=int, default=0)
     ap.add_argument("--early_stop_min_epochs", type=int, default=30)
     ap.add_argument("--early_stop_patience", type=int, default=12)
-    ap.add_argument("--early_stop_min_epochs", type=int, default=10)
-    ap.add_argument("--early_stop_patience", type=int, default=6)
 
     ap.add_argument("--python", default=sys.executable)
     ap.add_argument("--continue_on_error", action="store_true")

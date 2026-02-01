@@ -2608,11 +2608,11 @@ if __name__ == "__main__":
     # ------------------------------------------------------------
     ROOT_DIR = str(Path(__file__).resolve().parent)
 
-    DATASET_NPY = ROOT_DIR + "/dataset/dataset_2026-01-13_masked.npy"
-    MASK_NPY = ROOT_DIR + "/dataset/mask_2026-01-13_masked.npy"
-    ASSETS_TXT = ROOT_DIR + "/dataset/assets_2026-01-13.txt"
-    DATES_TXT = ROOT_DIR + "/dataset/dates_2026-01-13.txt"
-    FEATURES_JS = ROOT_DIR + "/dataset/features_2026-01-13.json"
+    DATASET_NPY = ROOT_DIR + "/dataset/dataset_2026-02-01_masked.npy"
+    MASK_NPY = ROOT_DIR + "/dataset/mask_2026-02-01_masked.npy"
+    ASSETS_TXT = ROOT_DIR + "/dataset/assets_2026-02-01.txt"
+    DATES_TXT = ROOT_DIR + "/dataset/dates_2026-02-01.txt"
+    FEATURES_JS = ROOT_DIR + "/dataset/features_2026-02-01.json"
 
     OUTDIR = ROOT_DIR + "/runs"
     FOCUS_ASSET = ""  # e.g. "DRO.AX" or "" to disable
