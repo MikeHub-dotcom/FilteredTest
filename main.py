@@ -189,6 +189,12 @@ class Config:
     itr_use_cls: bool = True  # CLS-Token statt Pooling
     itr_pool: str = "mean"  # falls itr_use_cls=False: "mean" | "max"
 
+    # --- Sidecar FiLM conditioning ---
+    use_sidecars: bool = False
+    sidecar_emb_dim: int = 32
+    sidecar_mlp_hidden: int = 128
+    sidecar_dropout: float = 0.10
+
 
 
 def sample_trial_cfg_tcn(base: Config, rng: np.random.Generator) -> Config:
@@ -414,6 +420,7 @@ def run_single_training(
         theta=cfg.ignore_band_logret,
         max_anchors=cfg.max_anchors_train,
         seed=cfg.seed_trials,
+        sidecar_ids=getattr(args, "_sidecar_ids_arr", None)
     )
     val_ds = CubeProfitDataset(
         X=Xn, M=M, close_idx=close_idx,
@@ -426,6 +433,7 @@ def run_single_training(
         theta=cfg.ignore_band_logret,
         max_anchors=cfg.max_anchors_val,
         seed=cfg.seed_trials + 1,
+        sidecar_ids=getattr(args, "_sidecar_ids_arr", None)
     )
 
     pin = (cfg.device == "cuda")
@@ -434,7 +442,12 @@ def run_single_training(
     val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False,
                             num_workers=cfg.num_workers, pin_memory=pin)
 
-    model = build_model(cfg, in_ch=2 * F).to(cfg.device)
+    # enable FiLM for sweep too (if requested)
+    model = build_model(
+        cfg,
+        in_ch=2 * F,
+        sidecar_vocab_sizes=getattr(args, "_sidecar_vocab_sizes", None),
+    ).to(cfg.device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.epochs)
 
@@ -507,6 +520,7 @@ class CubeProfitDataset(Dataset):
             require_close_obs: bool = True,
             max_anchors: int = 0,
             seed: int = 0,
+            sidecar_ids: Optional[np.ndarray] = None,  # (A,I) int
     ):
         super().__init__()
         assert X.ndim == 3 and M.ndim == 3
@@ -524,6 +538,13 @@ class CubeProfitDataset(Dataset):
         self.theta = float(theta)
         self.max_anchors = int(max_anchors)
         self.seed = int(seed)
+
+        if sidecar_ids is not None:
+            if sidecar_ids.ndim != 2 or sidecar_ids.shape[0] != A:
+                raise ValueError(f"sidecar_ids must be (A,I) with A={A}, got {sidecar_ids.shape}")
+            self.sidecar_ids = sidecar_ids.astype(np.int64, copy=False)
+        else:
+            self.sidecar_ids = None
 
         self.t_start = t_start
         self.t_end = t_end
@@ -620,7 +641,53 @@ class CubeProfitDataset(Dataset):
         y_t = torch.tensor([y], dtype=torch.float32)  # (1,)
         v_t = torch.tensor([valid], dtype=torch.float32)
 
-        return x_t, y_t, v_t
+        if self.sidecar_ids is None:
+            return x_t, y_t, v_t
+        s_t = torch.from_numpy(self.sidecar_ids[a]).long()  # (I,)
+        return x_t, y_t, v_t, s_t
+
+
+# ----------------------------
+# Sidecar FiLM (Asset-level conditioning)
+# ----------------------------
+class SidecarFiLM(nn.Module):
+    """
+    Inputs:
+      s: (B, I) int64 sidecar IDs (one categorical per field)
+    Produces:
+      gamma, beta: (B, D) to modulate a hidden vector h: h' = h * (1 + gamma) + beta
+    """
+    def __init__(
+        self,
+        vocab_sizes: List[int],  # length I
+        hidden_dim: int,         # D
+        emb_dim: int = 32,
+        mlp_hidden: int = 128,
+        dropout: float = 0.10,
+    ):
+        super().__init__()
+        self.I = int(len(vocab_sizes))
+        self.hidden_dim = int(hidden_dim)
+        self.embs = nn.ModuleList([nn.Embedding(int(vs), int(emb_dim)) for vs in vocab_sizes])
+        in_dim = self.I * int(emb_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, int(mlp_hidden)),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(int(mlp_hidden), 2 * self.hidden_dim),
+        )
+
+    def forward(self, s: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # s: (B,I)
+        if s.dim() != 2 or s.size(1) != self.I:
+            raise ValueError(f"expected sidecars (B,{self.I}), got {tuple(s.shape)}")
+        parts = []
+        for j, emb in enumerate(self.embs):
+            parts.append(emb(s[:, j]))
+        e = torch.cat(parts, dim=1)  # (B, I*emb_dim)
+        gb = self.mlp(e)             # (B, 2D)
+        gamma, beta = gb.chunk(2, dim=1)
+        return gamma, beta
 
 
 # ----------------------------
@@ -644,18 +711,27 @@ class ConvNet1D(nn.Module):
 
             nn.AdaptiveAvgPool1d(1),  # -> (B,64,1)
         )
-        self.head = nn.Sequential(
-            nn.Flatten(),  # -> (B,64)
+        self.pre = nn.Sequential(
             nn.Linear(64, 64),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(64, 1)  # logit
         )
+        self.out = nn.Linear(64, 1)
+        self.film: Optional[SidecarFiLM] = None
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def set_film(self, film: SidecarFiLM) -> None:
+        self.film = film
+
+    def forward(self, x: torch.Tensor, s: Optional[torch.Tensor] = None) -> torch.Tensor:
         z = self.net(x)
-        logit = self.head(z)
-        return logit
+        h = z.squeeze(-1)  # (B,64)
+        h = self.pre(h)
+        if self.film is not None:
+            if s is None:
+                raise RuntimeError("Sidecars enabled but s is None.")
+            gamma, beta = self.film(s)
+            h = h * (1.0 + gamma) + beta
+        return self.out(h)
 
 
 class ResidualTCNBlock(nn.Module):
@@ -745,19 +821,28 @@ class TCNModel(nn.Module):
         self.backbone = nn.Sequential(*blocks)
         self.pool = nn.AdaptiveAvgPool1d(1)  # (B,channels,1)
 
-        # small head; keep it simple for finance robustness
-        self.head = nn.Sequential(
-            nn.Flatten(),
+        self.pre = nn.Sequential(
             nn.Linear(channels, channels // 2),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(channels // 2, 1),
         )
+        self.out = nn.Linear(channels // 2, 1)
+        self.film: Optional[SidecarFiLM] = None
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def set_film(self, film: SidecarFiLM) -> None:
+        self.film = film
+
+    def forward(self, x: torch.Tensor, s: Optional[torch.Tensor] = None) -> torch.Tensor:
         z = self.backbone(x)
         z = self.pool(z)
-        return self.head(z)
+        h = z.squeeze(-1)  # (B,channels)
+        h = self.pre(h)
+        if self.film is not None:
+            if s is None:
+                raise RuntimeError("Sidecars enabled but s is None.")
+            gamma, beta = self.film(s)
+            h = h * (1.0 + gamma) + beta
+        return self.out(h)
 
 
 class PatchTSTModel(nn.Module):
@@ -822,6 +907,10 @@ class PatchTSTModel(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.norm = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, 1)
+        self.film: Optional[SidecarFiLM] = None
+
+    def set_film(self, film: SidecarFiLM) -> None:
+        self.film = film
 
     def _make_patches(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -849,7 +938,7 @@ class PatchTSTModel(nn.Module):
             patches.append(p.reshape(B, -1)) # (B, C*patch_len)
         return torch.stack(patches, dim=1)   # (B, N, token_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, s: Optional[torch.Tensor] = None) -> torch.Tensor:
         # x: (B, C, L)
         patches = self._make_patches(x)              # (B, N, token_dim)
         z = self.proj(patches)                       # (B, N, d_model)
@@ -861,7 +950,13 @@ class PatchTSTModel(nn.Module):
         z = self.encoder(z)
         z = self.norm(z)
         cls_out = z[:, 0, :]
-        return self.head(cls_out)
+        h = cls_out
+        if self.film is not None:
+            if s is None:
+                raise RuntimeError("Sidecars enabled but s is None.")
+            gamma, beta = self.film(s)
+            h = h * (1.0 + gamma) + beta
+        return self.head(h)
 
 
 class ITransformerModel(nn.Module):
@@ -913,12 +1008,16 @@ class ITransformerModel(nn.Module):
             nn.Dropout(float(cfg.dropout)),
             nn.Linear(self.d_model, 1),
         )
+        self.film: Optional[SidecarFiLM] = None
+
+    def set_film(self, film: SidecarFiLM) -> None:
+        self.film = film
 
         nn.init.normal_(self.pos, mean=0.0, std=0.02)
         if self.cls is not None:
             nn.init.normal_(self.cls, mean=0.0, std=0.02)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, s: Optional[torch.Tensor] = None) -> torch.Tensor:
         # x: (B, C, L)
         if x.dim() != 3:
             raise ValueError(f"expected x shape (B,C,L), got {tuple(x.shape)}")
@@ -962,16 +1061,27 @@ class ITransformerModel(nn.Module):
             else:
                 h = z.mean(dim=1)
 
+        if self.film is not None:
+            if s is None:
+                raise RuntimeError("Sidecars enabled but s is None.")
+            gamma, beta = self.film(s)
+            h = h * (1.0 + gamma) + beta
         return self.head(h)
 
 
 
-def build_model(cfg: Config, in_ch: int) -> nn.Module:
+def build_model(cfg: Config, in_ch: int, sidecar_vocab_sizes: Optional[List[int]] = None) -> nn.Module:
     mt = str(cfg.model_type).lower().strip()
     if mt == "cnn":
-        return ConvNet1D(in_ch=in_ch, dropout=cfg.dropout)
+        m = ConvNet1D(in_ch=in_ch, dropout=cfg.dropout)
+        if cfg.use_sidecars:
+            film = SidecarFiLM(sidecar_vocab_sizes, hidden_dim=64,
+                               emb_dim=cfg.sidecar_emb_dim, mlp_hidden=cfg.sidecar_mlp_hidden,
+                               dropout=cfg.sidecar_dropout)
+            m.set_film(film)
+        return m
     if mt == "tcn":
-        return TCNModel(
+        m = TCNModel(
             in_ch=in_ch,
             channels=int(cfg.tcn_channels),
             levels=int(cfg.tcn_levels),
@@ -979,8 +1089,14 @@ def build_model(cfg: Config, in_ch: int) -> nn.Module:
             dropout=float(cfg.tcn_dropout),
             use_groupnorm=bool(cfg.tcn_use_groupnorm),
         )
+        if cfg.use_sidecars:
+            film = SidecarFiLM(sidecar_vocab_sizes, hidden_dim=int(cfg.tcn_channels // 2),
+                               emb_dim=cfg.sidecar_emb_dim, mlp_hidden=cfg.sidecar_mlp_hidden,
+                               dropout=cfg.sidecar_dropout)
+            m.set_film(film)
+        return m
     if mt == "patchtst":
-        return PatchTSTModel(
+        m = PatchTSTModel(
             in_ch=in_ch,
             lookback=int(cfg.lookback),
             patch_len=int(cfg.patch_len),
@@ -992,12 +1108,24 @@ def build_model(cfg: Config, in_ch: int) -> nn.Module:
             dropout=float(cfg.dropout),
             norm_first=bool(cfg.norm_first),
         )
+        if cfg.use_sidecars:
+            film = SidecarFiLM(sidecar_vocab_sizes, hidden_dim=int(cfg.d_model),
+                               emb_dim=cfg.sidecar_emb_dim, mlp_hidden=cfg.sidecar_mlp_hidden,
+                               dropout=cfg.sidecar_dropout)
+            m.set_film(film)
+        return m
     if mt in ("itransformer", "itr", "i_transformer"):
-        return ITransformerModel(
+        m = ITransformerModel(
             in_ch=in_ch,
             lookback=int(cfg.lookback),
             cfg=cfg,
         )
+        if cfg.use_sidecars:
+            film = SidecarFiLM(sidecar_vocab_sizes, hidden_dim=int(cfg.d_model),
+                               emb_dim=cfg.sidecar_emb_dim, mlp_hidden=cfg.sidecar_mlp_hidden,
+                               dropout=cfg.sidecar_dropout)
+            m.set_film(film)
+        return m
     raise ValueError(f"Unknown model_type='{cfg.model_type}'. Use 'cnn' or 'tcn', 'patchtst' or 'itransformer'.")
 
 
@@ -1015,11 +1143,18 @@ def evaluate_classifier(
     y_all = []
     v_all = []
 
-    for x, y, v in loader:
+    for batch in loader:
+        if len(batch) == 3:
+            x, y, v = batch
+            s = None
+        else:
+            x, y, v, s = batch
         x = x.to(device)
         y = y.to(device)
         v = v.to(device)
-        logit = model(x)
+        if s is not None:
+            s = s.to(device)
+        logit = model(x, s)
 
         logits_all.append(logit.detach().cpu())
         y_all.append(y.detach().cpu())
@@ -1069,9 +1204,12 @@ def threshold_search_for_profitability(
     for i in range(0, n, B):
         batch = [dataset[j] for j in range(i, min(i + B, n))]
         x = torch.stack([b[0] for b in batch], dim=0).to(device)
+        s = None
+        if len(batch[0]) == 4:
+            s = torch.stack([b[3] for b in batch], dim=0).to(device)
 
         # compute p
-        logit = model(x).detach().cpu().numpy().squeeze(1)
+        logit = model(x, s).detach().cpu().numpy().squeeze(1)
         p = 1.0 / (1.0 + np.exp(-logit))
         probs[i:i + len(batch)] = p.astype(np.float32)
 
@@ -1211,6 +1349,7 @@ def predict_probs_for_asset(
     lookback: int,
     device: str,
     batch: int = 2048,
+    sidecar_ids: Optional[np.ndarray] = None,  # (A,I)
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Returns times ts and probabilities p(ts) for anchors t in [t0..t1]
@@ -1241,7 +1380,12 @@ def predict_probs_for_asset(
 
     for i in range(0, len(valid_t), batch):
         xb = torch.stack(seqs[i:i + batch], dim=0).to(device)
-        logit = model(xb).detach().cpu().numpy().squeeze(1)
+        sb = None
+        if sidecar_ids is not None:
+            # repeat the asset's sidecar row for the whole batch
+            s_row = torch.from_numpy(sidecar_ids[a]).long().to(device)  # (I,)
+            sb = s_row.unsqueeze(0).expand(xb.size(0), -1).contiguous()  # (B,I)
+        logit = model(xb, sb).detach().cpu().numpy().squeeze(1)
         p = 1.0 / (1.0 + np.exp(-logit))
         probs[i:i + len(p)] = p.astype(np.float32)
 
@@ -1429,6 +1573,7 @@ def run_test_report(
     trade_fee_eur: float,
     exec_delay_days: int,
     hysteresis: float,
+    sidecar_ids: Optional[np.ndarray] = None,  # (A,I) or None
 ) -> str:
     """
     Creates timestamped test report folder with:
@@ -1476,6 +1621,7 @@ def run_test_report(
             lookback=cfg.lookback,
             device=cfg.device,
             batch=2048,
+            sidecar_ids=sidecar_ids,
         )
 
         if len(ts_idx) == 0:
@@ -1573,17 +1719,29 @@ def train_one_epoch(
     alpha = 0.05  # EMA smoothing
     t0 = time.time()
 
-    for step, (x, y, v) in enumerate(loader, start=1):
+    for step, batch in enumerate(loader, start=1):
+        # batch is either (x,y,v) or (x,y,v,s)
+        if len(batch) == 3:
+            x, y, v = batch
+            s = None
+        elif len(batch) == 4:
+            x, y, v, s = batch
+        else:
+            raise RuntimeError(f"Unexpected batch size={len(batch)}; expected 3 or 4.")
+
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
         v = v.to(device, non_blocking=True)
+        if s is not None:
+            s = s.to(device, non_blocking=True)
 
         opt.zero_grad(set_to_none=True)
 
         use_amp = bool(amp and device.startswith("cuda") and scaler is not None)
 
         with amp_autocast(amp_device_type(device), enabled=use_amp):
-            logit = model(x)
+            # models should accept forward(x, s=None)
+            logit = model(x, s) if s is not None else model(x, None)
             logit = torch.clamp(logit, -10.0, 10.0)
             loss_raw = loss_fn(logit, y)
             loss = (loss_raw * v).sum() / (v.sum() + 1e-9)
@@ -1698,6 +1856,9 @@ def main():
     ap.add_argument("--assets", required=True, help="Path to assets_*.txt")
     ap.add_argument("--dates", required=True, help="Path to dates_*.txt")
     ap.add_argument("--features", required=True, help="Path to features_*.json")
+    # --- Sidecars (Asset x Info) ---
+    ap.add_argument("--use_sidecars", action="store_true", help="Enable FiLM conditioning with sidecar IDs.")
+    ap.add_argument("--sidecar_ids", default="", help="Path to meta_ids_clean_*.npy (shape A x I).")
     ap.add_argument("--outdir", default="./runs", help="Output directory")
     ap.add_argument("--asset_name", default="",
                     help="Optional: evaluate/focus on single asset name (must exist in assets list)")
@@ -1834,6 +1995,22 @@ def main():
     assert X.shape == M.shape
     A, T, F = X.shape
     safe_log(f"[INFO] loaded cube: A={A}, T={T}, F={F}")
+
+    sidecar_ids = None
+    sidecar_vocab_sizes = None
+    if args.use_sidecars:
+        if not args.sidecar_ids:
+            raise RuntimeError("--use_sidecars requires --sidecar_ids <path-to-meta_ids_clean_*.npy>")
+        sidecar_ids = np.load(args.sidecar_ids)
+        if sidecar_ids.ndim != 2 or sidecar_ids.shape[0] != A:
+            raise RuntimeError(f"sidecar_ids must have shape (A,I) with A={A}, got {sidecar_ids.shape}")
+        # vocab sizes per field (I entries): max_id+1
+        sidecar_vocab_sizes = (sidecar_ids.max(axis=0) + 1).astype(np.int64).tolist()
+        safe_log(f"[INFO] sidecars enabled: sidecar_ids={sidecar_ids.shape} vocab_sizes={sidecar_vocab_sizes}")
+
+    # Make available to sweep helpers without threading through all call signatures
+    args._sidecar_ids_arr = sidecar_ids
+    args._sidecar_vocab_sizes = sidecar_vocab_sizes
 
     # --- PATCH: resolve misc/report dirs ---
     project_root = _project_root_from_dataset_path(args.dataset)
@@ -2127,7 +2304,8 @@ def main():
                 if hasattr(cfg, k):
                     setattr(cfg, k, v)
 
-        model = build_model(cfg, in_ch=2 * F).to(cfg.device)
+        model = build_model(cfg, in_ch=2 * F,
+                            sidecar_vocab_sizes=getattr(args, "_sidecar_vocab_sizes", None)).to(cfg.device)
         model.load_state_dict(ckpt["model_state"] if isinstance(ckpt, dict) and "model_state" in ckpt else ckpt)
 
         # threshold choice
@@ -2160,6 +2338,7 @@ def main():
             trade_fee_eur=args.trade_fee_eur,
             exec_delay_days=args.exec_delay_days,
             hysteresis=args.hysteresis,
+            sidecar_ids=sidecar_ids
         )
 
         safe_log("[DONE]")
@@ -2207,6 +2386,7 @@ def main():
         theta=cfg.ignore_band_logret,
         max_anchors=cfg.max_anchors_train,
         seed=cfg.seed_trials,
+        sidecar_ids=getattr(args, "_sidecar_ids_arr", None),
     )
     val_ds = CubeProfitDataset(
         X=X, M=M, close_idx=close_idx,
@@ -2219,6 +2399,7 @@ def main():
         theta=cfg.ignore_band_logret,
         max_anchors=cfg.max_anchors_val,
         seed=cfg.seed_trials + 1,
+        sidecar_ids=getattr(args, "_sidecar_ids_arr", None),
     )
     test_ds = CubeProfitDataset(
         X=X, M=M, close_idx=close_idx,
@@ -2231,6 +2412,7 @@ def main():
         theta=cfg.ignore_band_logret,
         max_anchors=0,
         seed=cfg.seed_trials + 2,
+        sidecar_ids=getattr(args, "_sidecar_ids_arr", None),
     )
 
     safe_log(f"[INFO] samples: train={len(train_ds)} val={len(val_ds)} test={len(test_ds)}")
@@ -2245,7 +2427,8 @@ def main():
 
     # Model
     in_ch = 2 * F
-    model = build_model(cfg, in_ch=in_ch).to(cfg.device)
+    cfg.use_sidecars = bool(args.use_sidecars)
+    model = build_model(cfg, in_ch=in_ch, sidecar_vocab_sizes=sidecar_vocab_sizes).to(cfg.device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.epochs)
 
