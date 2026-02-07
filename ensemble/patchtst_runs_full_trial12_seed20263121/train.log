@@ -1,0 +1,215 @@
+
+==========================================================================================
+[2026-01-30T21:24:56] START trial=12 seed=20263121
+CMD: /home/ubuntu/venv/bin/python3 /tmp/pycharm_project_889/main.py --dataset /tmp/pycharm_project_889/dataset/dataset_2026-01-13_masked.npy --mask /tmp/pycharm_project_889/dataset/mask_2026-01-13_masked.npy --assets /tmp/pycharm_project_889/dataset/assets_2026-01-13.txt --dates /tmp/pycharm_project_889/dataset/dates_2026-01-13.txt --features /tmp/pycharm_project_889/dataset/features_2026-01-13.json --cfg /tmp/pycharm_project_889/runs_xfmr_sweep_mix/sweep/trial_0012/cfg.json --outdir /tmp/pycharm_project_889/runs_full_trial12_seed20263121 --epochs 120 --seed 20263121 --max_anchors_val 0 --early_stop_min_epochs 30 --early_stop_patience 12
+[INFO] 2026-01-30 21:24:58,114 - device=cuda
+[INFO] 2026-01-30 21:24:58,114 - device=cuda
+[INFO] loaded cube: A=2395, T=7000, F=25
+[INFO] time split: train=[0,4899] val=[4900,5949] test=[5950,6999]
+[INFO] date ranges: train 1999-01-04..2017-10-13 | val 2017-10-16..2021-10-22 | test 2021-10-25..2025-10-31
+[INFO] applied masked standardization using train-only statistics
+[INFO] asset_keep: 2395/2395 assets remain after mask-only filter
+[INFO] samples: train=8000 val=1562057 test=1567399
+/home/ubuntu/venv/lib/python3.12/site-packages/torch/nn/modules/transformer.py:392: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  warnings.warn(
+[INFO] 2026-01-30 21:25:12,759 - training start
+[INFO] 2026-01-30 21:25:12,759 - training start
+[INFO] 2026-01-30 21:25:13,505 - E001 S00001/00016 loss=0.769110 ema=0.769110 y_mean=0.465 lr=5.987e-05 step/s=1.44
+[INFO] 2026-01-30 21:25:13,505 - E001 S00001/00016 loss=0.769110 ema=0.769110 y_mean=0.465 lr=5.987e-05 step/s=1.44
+[INFO] 2026-01-30 21:32:52,559 - [VAL] thr=0.573 trades=662 avg_rnet=0.008404 winrate=0.592
+[INFO] 2026-01-30 21:32:52,559 - [VAL] thr=0.573 trades=662 avg_rnet=0.008404 winrate=0.592
+[INFO] 2026-01-30 21:32:52,559 - E001 DONE train_loss=0.739004 val_bce=0.693738 val_acc@0.5=0.5036 n_val=1562057 epoch_time_s=459.8
+[INFO] 2026-01-30 21:32:52,559 - E001 DONE train_loss=0.739004 val_bce=0.693738 val_acc@0.5=0.5036 n_val=1562057 epoch_time_s=459.8
+[INFO] 2026-01-30 21:32:52,643 - [CKPT] saved best_model.pt (best_val_avg_rnet=0.008404, trades=662, thr=0.573)
+[INFO] 2026-01-30 21:32:52,643 - [CKPT] saved best_model.pt (best_val_avg_rnet=0.008404, trades=662, thr=0.573)
+[INFO] 2026-01-30 21:32:52,705 - E002 S00001/00016 loss=0.694299 ema=0.694299 y_mean=0.502 lr=5.986e-05 step/s=16.37
+[INFO] 2026-01-30 21:32:52,705 - E002 S00001/00016 loss=0.694299 ema=0.694299 y_mean=0.502 lr=5.986e-05 step/s=16.37
+[INFO] 2026-01-30 21:38:29,334 - [VAL] thr=0.531 trades=398 avg_rnet=0.011842 winrate=0.590
+[INFO] 2026-01-30 21:38:29,334 - [VAL] thr=0.531 trades=398 avg_rnet=0.011842 winrate=0.590
+[INFO] 2026-01-30 21:38:29,334 - E002 DONE train_loss=0.693614 val_bce=0.693070 val_acc@0.5=0.5083 n_val=1562057 epoch_time_s=336.7
+[INFO] 2026-01-30 21:38:29,334 - E002 DONE train_loss=0.693614 val_bce=0.693070 val_acc@0.5=0.5083 n_val=1562057 epoch_time_s=336.7
+[INFO] 2026-01-30 21:38:29,438 - [CKPT] saved best_model.pt (best_val_avg_rnet=0.011842, trades=398, thr=0.531)
+[INFO] 2026-01-30 21:38:29,438 - [CKPT] saved best_model.pt (best_val_avg_rnet=0.011842, trades=398, thr=0.531)
+[INFO] 2026-01-30 21:38:29,502 - E003 S00001/00016 loss=0.692340 ema=0.692340 y_mean=0.484 lr=5.983e-05 step/s=15.84
+[INFO] 2026-01-30 21:38:29,502 - E003 S00001/00016 loss=0.692340 ema=0.692340 y_mean=0.484 lr=5.983e-05 step/s=15.84
+[INFO] 2026-01-30 21:44:07,636 - [VAL] thr=0.543 trades=704 avg_rnet=0.009020 winrate=0.595
+[INFO] 2026-01-30 21:44:07,636 - [VAL] thr=0.543 trades=704 avg_rnet=0.009020 winrate=0.595
+[INFO] 2026-01-30 21:44:07,637 - E003 DONE train_loss=0.693113 val_bce=0.693012 val_acc@0.5=0.5012 n_val=1562057 epoch_time_s=338.2
+[INFO] 2026-01-30 21:44:07,637 - E003 DONE train_loss=0.693113 val_bce=0.693012 val_acc@0.5=0.5012 n_val=1562057 epoch_time_s=338.2
+[INFO] 2026-01-30 21:44:07,699 - E004 S00001/00016 loss=0.691641 ema=0.691641 y_mean=0.479 lr=5.978e-05 step/s=16.15
+[INFO] 2026-01-30 21:44:07,699 - E004 S00001/00016 loss=0.691641 ema=0.691641 y_mean=0.479 lr=5.978e-05 step/s=16.15
+[INFO] 2026-01-30 21:49:46,306 - [VAL] thr=0.604 trades=106 avg_rnet=0.013151 winrate=0.604
+[INFO] 2026-01-30 21:49:46,306 - [VAL] thr=0.604 trades=106 avg_rnet=0.013151 winrate=0.604
+[INFO] 2026-01-30 21:49:46,306 - E004 DONE train_loss=0.693274 val_bce=0.693279 val_acc@0.5=0.5006 n_val=1562057 epoch_time_s=338.7
+[INFO] 2026-01-30 21:49:46,306 - E004 DONE train_loss=0.693274 val_bce=0.693279 val_acc@0.5=0.5006 n_val=1562057 epoch_time_s=338.7
+[INFO] 2026-01-30 21:49:46,410 - [CKPT] saved best_model.pt (best_val_avg_rnet=0.013151, trades=106, thr=0.604)
+[INFO] 2026-01-30 21:49:46,410 - [CKPT] saved best_model.pt (best_val_avg_rnet=0.013151, trades=106, thr=0.604)
+[INFO] 2026-01-30 21:49:46,473 - E005 S00001/00016 loss=0.691239 ema=0.691239 y_mean=0.480 lr=5.971e-05 step/s=16.11
+[INFO] 2026-01-30 21:49:46,473 - E005 S00001/00016 loss=0.691239 ema=0.691239 y_mean=0.480 lr=5.971e-05 step/s=16.11
+[INFO] 2026-01-30 21:55:22,159 - [VAL] thr=0.518 trades=796 avg_rnet=0.008611 winrate=0.589
+[INFO] 2026-01-30 21:55:22,159 - [VAL] thr=0.518 trades=796 avg_rnet=0.008611 winrate=0.589
+[INFO] 2026-01-30 21:55:22,159 - E005 DONE train_loss=0.693445 val_bce=0.695947 val_acc@0.5=0.5034 n_val=1562057 epoch_time_s=335.7
+[INFO] 2026-01-30 21:55:22,159 - E005 DONE train_loss=0.693445 val_bce=0.695947 val_acc@0.5=0.5034 n_val=1562057 epoch_time_s=335.7
+[INFO] 2026-01-30 21:55:22,335 - E006 S00001/00016 loss=0.693089 ema=0.693089 y_mean=0.479 lr=5.962e-05 step/s=5.70
+[INFO] 2026-01-30 21:55:22,335 - E006 S00001/00016 loss=0.693089 ema=0.693089 y_mean=0.479 lr=5.962e-05 step/s=5.70
+[INFO] 2026-01-30 22:00:58,254 - [VAL] thr=0.604 trades=696 avg_rnet=0.010359 winrate=0.602
+[INFO] 2026-01-30 22:00:58,254 - [VAL] thr=0.604 trades=696 avg_rnet=0.010359 winrate=0.602
+[INFO] 2026-01-30 22:00:58,254 - E006 DONE train_loss=0.694373 val_bce=0.696436 val_acc@0.5=0.4973 n_val=1562057 epoch_time_s=336.1
+[INFO] 2026-01-30 22:00:58,254 - E006 DONE train_loss=0.694373 val_bce=0.696436 val_acc@0.5=0.4973 n_val=1562057 epoch_time_s=336.1
+[INFO] 2026-01-30 22:00:58,317 - E007 S00001/00016 loss=0.691004 ema=0.691004 y_mean=0.492 lr=5.951e-05 step/s=16.13
+[INFO] 2026-01-30 22:00:58,317 - E007 S00001/00016 loss=0.691004 ema=0.691004 y_mean=0.492 lr=5.951e-05 step/s=16.13
+[INFO] 2026-01-30 22:06:36,184 - [VAL] thr=0.512 trades=785 avg_rnet=0.008725 winrate=0.590
+[INFO] 2026-01-30 22:06:36,184 - [VAL] thr=0.512 trades=785 avg_rnet=0.008725 winrate=0.590
+[INFO] 2026-01-30 22:06:36,184 - E007 DONE train_loss=0.690600 val_bce=0.702782 val_acc@0.5=0.5035 n_val=1562057 epoch_time_s=337.9
+[INFO] 2026-01-30 22:06:36,184 - E007 DONE train_loss=0.690600 val_bce=0.702782 val_acc@0.5=0.5035 n_val=1562057 epoch_time_s=337.9
+[INFO] 2026-01-30 22:06:36,248 - E008 S00001/00016 loss=0.704521 ema=0.704521 y_mean=0.508 lr=5.937e-05 step/s=15.81
+[INFO] 2026-01-30 22:06:36,248 - E008 S00001/00016 loss=0.704521 ema=0.704521 y_mean=0.508 lr=5.937e-05 step/s=15.81
+[INFO] 2026-01-30 22:12:13,142 - [VAL] thr=0.629 trades=497 avg_rnet=0.011055 winrate=0.594
+[INFO] 2026-01-30 22:12:13,142 - [VAL] thr=0.629 trades=497 avg_rnet=0.011055 winrate=0.594
+[INFO] 2026-01-30 22:12:13,142 - E008 DONE train_loss=0.691827 val_bce=0.694508 val_acc@0.5=0.5073 n_val=1562057 epoch_time_s=337.0
+[INFO] 2026-01-30 22:12:13,142 - E008 DONE train_loss=0.691827 val_bce=0.694508 val_acc@0.5=0.5073 n_val=1562057 epoch_time_s=337.0
+[INFO] 2026-01-30 22:12:13,205 - E009 S00001/00016 loss=0.690653 ema=0.690653 y_mean=0.498 lr=5.922e-05 step/s=16.05
+[INFO] 2026-01-30 22:12:13,205 - E009 S00001/00016 loss=0.690653 ema=0.690653 y_mean=0.498 lr=5.922e-05 step/s=16.05
+[INFO] 2026-01-30 22:17:48,922 - [VAL] thr=0.653 trades=762 avg_rnet=0.007689 winrate=0.591
+[INFO] 2026-01-30 22:17:48,922 - [VAL] thr=0.653 trades=762 avg_rnet=0.007689 winrate=0.591
+[INFO] 2026-01-30 22:17:48,922 - E009 DONE train_loss=0.700513 val_bce=0.706726 val_acc@0.5=0.5036 n_val=1562057 epoch_time_s=335.8
+[INFO] 2026-01-30 22:17:48,922 - E009 DONE train_loss=0.700513 val_bce=0.706726 val_acc@0.5=0.5036 n_val=1562057 epoch_time_s=335.8
+[INFO] 2026-01-30 22:17:49,099 - E010 S00001/00016 loss=0.696392 ema=0.696392 y_mean=0.486 lr=5.905e-05 step/s=5.69
+[INFO] 2026-01-30 22:17:49,099 - E010 S00001/00016 loss=0.696392 ema=0.696392 y_mean=0.486 lr=5.905e-05 step/s=5.69
+[INFO] 2026-01-30 22:23:23,899 - [VAL] thr=0.580 trades=807 avg_rnet=0.008793 winrate=0.590
+[INFO] 2026-01-30 22:23:23,899 - [VAL] thr=0.580 trades=807 avg_rnet=0.008793 winrate=0.590
+[INFO] 2026-01-30 22:23:23,899 - E010 DONE train_loss=0.691014 val_bce=0.693285 val_acc@0.5=0.5050 n_val=1562057 epoch_time_s=335.0
+[INFO] 2026-01-30 22:23:23,899 - E010 DONE train_loss=0.691014 val_bce=0.693285 val_acc@0.5=0.5050 n_val=1562057 epoch_time_s=335.0
+[INFO] 2026-01-30 22:23:23,962 - E011 S00001/00016 loss=0.690276 ema=0.690276 y_mean=0.498 lr=5.885e-05 step/s=16.01
+[INFO] 2026-01-30 22:23:23,962 - E011 S00001/00016 loss=0.690276 ema=0.690276 y_mean=0.498 lr=5.885e-05 step/s=16.01
+[INFO] 2026-01-30 22:28:59,792 - [VAL] thr=0.635 trades=779 avg_rnet=0.008629 winrate=0.593
+[INFO] 2026-01-30 22:28:59,792 - [VAL] thr=0.635 trades=779 avg_rnet=0.008629 winrate=0.593
+[INFO] 2026-01-30 22:28:59,792 - E011 DONE train_loss=0.689426 val_bce=0.693070 val_acc@0.5=0.5190 n_val=1562057 epoch_time_s=335.9
+[INFO] 2026-01-30 22:28:59,792 - E011 DONE train_loss=0.689426 val_bce=0.693070 val_acc@0.5=0.5190 n_val=1562057 epoch_time_s=335.9
+[INFO] 2026-01-30 22:28:59,855 - E012 S00001/00016 loss=0.684987 ema=0.684987 y_mean=0.523 lr=5.864e-05 step/s=16.01
+[INFO] 2026-01-30 22:28:59,855 - E012 S00001/00016 loss=0.684987 ema=0.684987 y_mean=0.523 lr=5.864e-05 step/s=16.01
+[INFO] 2026-01-30 22:34:37,747 - [VAL] thr=0.714 trades=230 avg_rnet=0.005636 winrate=0.526
+[INFO] 2026-01-30 22:34:37,747 - [VAL] thr=0.714 trades=230 avg_rnet=0.005636 winrate=0.526
+[INFO] 2026-01-30 22:34:37,747 - E012 DONE train_loss=0.686811 val_bce=0.702006 val_acc@0.5=0.5056 n_val=1562057 epoch_time_s=338.0
+[INFO] 2026-01-30 22:34:37,747 - E012 DONE train_loss=0.686811 val_bce=0.702006 val_acc@0.5=0.5056 n_val=1562057 epoch_time_s=338.0
+[INFO] 2026-01-30 22:34:37,809 - E013 S00001/00016 loss=0.684022 ema=0.684022 y_mean=0.496 lr=5.841e-05 step/s=16.36
+[INFO] 2026-01-30 22:34:37,809 - E013 S00001/00016 loss=0.684022 ema=0.684022 y_mean=0.496 lr=5.841e-05 step/s=16.36
+[INFO] 2026-01-30 22:40:14,306 - [VAL] thr=0.739 trades=798 avg_rnet=0.008141 winrate=0.595
+[INFO] 2026-01-30 22:40:14,306 - [VAL] thr=0.739 trades=798 avg_rnet=0.008141 winrate=0.595
+[INFO] 2026-01-30 22:40:14,306 - E013 DONE train_loss=0.687482 val_bce=0.696367 val_acc@0.5=0.5161 n_val=1562057 epoch_time_s=336.6
+[INFO] 2026-01-30 22:40:14,306 - E013 DONE train_loss=0.687482 val_bce=0.696367 val_acc@0.5=0.5161 n_val=1562057 epoch_time_s=336.6
+[INFO] 2026-01-30 22:40:14,528 - E014 S00001/00016 loss=0.679867 ema=0.679867 y_mean=0.488 lr=5.816e-05 step/s=4.52
+[INFO] 2026-01-30 22:40:14,528 - E014 S00001/00016 loss=0.679867 ema=0.679867 y_mean=0.488 lr=5.816e-05 step/s=4.52
+[INFO] 2026-01-30 22:45:50,783 - [VAL] thr=0.794 trades=100 avg_rnet=0.018522 winrate=0.580
+[INFO] 2026-01-30 22:45:50,783 - [VAL] thr=0.794 trades=100 avg_rnet=0.018522 winrate=0.580
+[INFO] 2026-01-30 22:45:50,784 - E014 DONE train_loss=0.680464 val_bce=0.702157 val_acc@0.5=0.5161 n_val=1562057 epoch_time_s=336.5
+[INFO] 2026-01-30 22:45:50,784 - E014 DONE train_loss=0.680464 val_bce=0.702157 val_acc@0.5=0.5161 n_val=1562057 epoch_time_s=336.5
+[INFO] 2026-01-30 22:45:50,888 - [CKPT] saved best_model.pt (best_val_avg_rnet=0.018522, trades=100, thr=0.794)
+[INFO] 2026-01-30 22:45:50,888 - [CKPT] saved best_model.pt (best_val_avg_rnet=0.018522, trades=100, thr=0.794)
+[INFO] 2026-01-30 22:45:50,950 - E015 S00001/00016 loss=0.662171 ema=0.662171 y_mean=0.510 lr=5.789e-05 step/s=16.43
+[INFO] 2026-01-30 22:45:50,950 - E015 S00001/00016 loss=0.662171 ema=0.662171 y_mean=0.510 lr=5.789e-05 step/s=16.43
+[INFO] 2026-01-30 22:51:28,589 - [VAL] thr=0.818 trades=416 avg_rnet=0.010167 winrate=0.582
+[INFO] 2026-01-30 22:51:28,589 - [VAL] thr=0.818 trades=416 avg_rnet=0.010167 winrate=0.582
+[INFO] 2026-01-30 22:51:28,590 - E015 DONE train_loss=0.680852 val_bce=0.706923 val_acc@0.5=0.5058 n_val=1562057 epoch_time_s=337.7
+[INFO] 2026-01-30 22:51:28,590 - E015 DONE train_loss=0.680852 val_bce=0.706923 val_acc@0.5=0.5058 n_val=1562057 epoch_time_s=337.7
+[INFO] 2026-01-30 22:51:28,653 - E016 S00001/00016 loss=0.671350 ema=0.671350 y_mean=0.471 lr=5.759e-05 step/s=16.01
+[INFO] 2026-01-30 22:51:28,653 - E016 S00001/00016 loss=0.671350 ema=0.671350 y_mean=0.471 lr=5.759e-05 step/s=16.01
+[INFO] 2026-01-30 22:57:06,843 - [VAL] thr=0.770 trades=306 avg_rnet=0.007658 winrate=0.552
+[INFO] 2026-01-30 22:57:06,843 - [VAL] thr=0.770 trades=306 avg_rnet=0.007658 winrate=0.552
+[INFO] 2026-01-30 22:57:06,843 - E016 DONE train_loss=0.683764 val_bce=0.700802 val_acc@0.5=0.5071 n_val=1562057 epoch_time_s=338.3
+[INFO] 2026-01-30 22:57:06,843 - E016 DONE train_loss=0.683764 val_bce=0.700802 val_acc@0.5=0.5071 n_val=1562057 epoch_time_s=338.3
+[INFO] 2026-01-30 22:57:06,906 - E017 S00001/00016 loss=0.661494 ema=0.661494 y_mean=0.471 lr=5.729e-05 step/s=16.02
+[INFO] 2026-01-30 22:57:06,906 - E017 S00001/00016 loss=0.661494 ema=0.661494 y_mean=0.471 lr=5.729e-05 step/s=16.02
+[INFO] 2026-01-30 23:02:45,465 - [VAL] thr=0.923 trades=117 avg_rnet=0.032336 winrate=0.615
+[INFO] 2026-01-30 23:02:45,465 - [VAL] thr=0.923 trades=117 avg_rnet=0.032336 winrate=0.615
+[INFO] 2026-01-30 23:02:45,465 - E017 DONE train_loss=0.670080 val_bce=0.742296 val_acc@0.5=0.5061 n_val=1562057 epoch_time_s=338.6
+[INFO] 2026-01-30 23:02:45,465 - E017 DONE train_loss=0.670080 val_bce=0.742296 val_acc@0.5=0.5061 n_val=1562057 epoch_time_s=338.6
+[INFO] 2026-01-30 23:02:45,570 - [CKPT] saved best_model.pt (best_val_avg_rnet=0.032336, trades=117, thr=0.923)
+[INFO] 2026-01-30 23:02:45,570 - [CKPT] saved best_model.pt (best_val_avg_rnet=0.032336, trades=117, thr=0.923)
+[INFO] 2026-01-30 23:02:45,633 - E018 S00001/00016 loss=0.650513 ema=0.650513 y_mean=0.461 lr=5.696e-05 step/s=16.04
+[INFO] 2026-01-30 23:02:45,633 - E018 S00001/00016 loss=0.650513 ema=0.650513 y_mean=0.461 lr=5.696e-05 step/s=16.04
+[INFO] 2026-01-30 23:08:24,095 - [VAL] thr=0.861 trades=356 avg_rnet=0.007844 winrate=0.598
+[INFO] 2026-01-30 23:08:24,095 - [VAL] thr=0.861 trades=356 avg_rnet=0.007844 winrate=0.598
+[INFO] 2026-01-30 23:08:24,096 - E018 DONE train_loss=0.666006 val_bce=0.721699 val_acc@0.5=0.5083 n_val=1562057 epoch_time_s=338.5
+[INFO] 2026-01-30 23:08:24,096 - E018 DONE train_loss=0.666006 val_bce=0.721699 val_acc@0.5=0.5083 n_val=1562057 epoch_time_s=338.5
+[INFO] 2026-01-30 23:08:24,159 - E019 S00001/00016 loss=0.663473 ema=0.663473 y_mean=0.488 lr=5.661e-05 step/s=16.13
+[INFO] 2026-01-30 23:08:24,159 - E019 S00001/00016 loss=0.663473 ema=0.663473 y_mean=0.488 lr=5.661e-05 step/s=16.13
+[INFO] 2026-01-30 23:14:02,676 - [VAL] thr=0.935 trades=128 avg_rnet=0.007887 winrate=0.594
+[INFO] 2026-01-30 23:14:02,676 - [VAL] thr=0.935 trades=128 avg_rnet=0.007887 winrate=0.594
+[INFO] 2026-01-30 23:14:02,677 - E019 DONE train_loss=0.655082 val_bce=0.757180 val_acc@0.5=0.4982 n_val=1562057 epoch_time_s=338.6
+[INFO] 2026-01-30 23:14:02,677 - E019 DONE train_loss=0.655082 val_bce=0.757180 val_acc@0.5=0.4982 n_val=1562057 epoch_time_s=338.6
+[INFO] 2026-01-30 23:14:02,741 - E020 S00001/00016 loss=0.638675 ema=0.638675 y_mean=0.520 lr=5.625e-05 step/s=16.04
+[INFO] 2026-01-30 23:14:02,741 - E020 S00001/00016 loss=0.638675 ema=0.638675 y_mean=0.520 lr=5.625e-05 step/s=16.04
+[INFO] 2026-01-30 23:19:39,003 - [VAL] thr=0.800 trades=3134 avg_rnet=0.003398 winrate=0.530
+[INFO] 2026-01-30 23:19:39,003 - [VAL] thr=0.800 trades=3134 avg_rnet=0.003398 winrate=0.530
+[INFO] 2026-01-30 23:19:39,003 - E020 DONE train_loss=0.644360 val_bce=0.727874 val_acc@0.5=0.5083 n_val=1562057 epoch_time_s=336.3
+[INFO] 2026-01-30 23:19:39,003 - E020 DONE train_loss=0.644360 val_bce=0.727874 val_acc@0.5=0.5083 n_val=1562057 epoch_time_s=336.3
+[INFO] 2026-01-30 23:19:39,065 - E021 S00001/00016 loss=0.647514 ema=0.647514 y_mean=0.459 lr=5.586e-05 step/s=16.22
+[INFO] 2026-01-30 23:19:39,065 - E021 S00001/00016 loss=0.647514 ema=0.647514 y_mean=0.459 lr=5.586e-05 step/s=16.22
+[INFO] 2026-01-30 23:25:16,507 - [VAL] thr=0.935 trades=1825 avg_rnet=0.005267 winrate=0.522
+[INFO] 2026-01-30 23:25:16,507 - [VAL] thr=0.935 trades=1825 avg_rnet=0.005267 winrate=0.522
+[INFO] 2026-01-30 23:25:16,507 - E021 DONE train_loss=0.630357 val_bce=0.790827 val_acc@0.5=0.4990 n_val=1562057 epoch_time_s=337.5
+[INFO] 2026-01-30 23:25:16,507 - E021 DONE train_loss=0.630357 val_bce=0.790827 val_acc@0.5=0.4990 n_val=1562057 epoch_time_s=337.5
+[INFO] 2026-01-30 23:25:16,569 - E022 S00001/00016 loss=0.633254 ema=0.633254 y_mean=0.498 lr=5.546e-05 step/s=16.26
+[INFO] 2026-01-30 23:25:16,569 - E022 S00001/00016 loss=0.633254 ema=0.633254 y_mean=0.498 lr=5.546e-05 step/s=16.26
+[INFO] 2026-01-30 23:30:53,793 - [VAL] thr=0.935 trades=485 avg_rnet=0.008345 winrate=0.491
+[INFO] 2026-01-30 23:30:53,793 - [VAL] thr=0.935 trades=485 avg_rnet=0.008345 winrate=0.491
+[INFO] 2026-01-30 23:30:53,793 - E022 DONE train_loss=0.612522 val_bce=0.769049 val_acc@0.5=0.5005 n_val=1562057 epoch_time_s=337.3
+[INFO] 2026-01-30 23:30:53,793 - E022 DONE train_loss=0.612522 val_bce=0.769049 val_acc@0.5=0.5005 n_val=1562057 epoch_time_s=337.3
+[INFO] 2026-01-30 23:30:53,901 - E023 S00001/00016 loss=0.623216 ema=0.623216 y_mean=0.512 lr=5.504e-05 step/s=9.38
+[INFO] 2026-01-30 23:30:53,901 - E023 S00001/00016 loss=0.623216 ema=0.623216 y_mean=0.512 lr=5.504e-05 step/s=9.38
+[INFO] 2026-01-30 23:36:31,933 - [VAL] thr=0.849 trades=5450 avg_rnet=0.003331 winrate=0.499
+[INFO] 2026-01-30 23:36:31,933 - [VAL] thr=0.849 trades=5450 avg_rnet=0.003331 winrate=0.499
+[INFO] 2026-01-30 23:36:31,933 - E023 DONE train_loss=0.616363 val_bce=0.776870 val_acc@0.5=0.5035 n_val=1562057 epoch_time_s=338.1
+[INFO] 2026-01-30 23:36:31,933 - E023 DONE train_loss=0.616363 val_bce=0.776870 val_acc@0.5=0.5035 n_val=1562057 epoch_time_s=338.1
+[INFO] 2026-01-30 23:36:32,039 - E024 S00001/00016 loss=0.626510 ema=0.626510 y_mean=0.502 lr=5.461e-05 step/s=9.52
+[INFO] 2026-01-30 23:36:32,039 - E024 S00001/00016 loss=0.626510 ema=0.626510 y_mean=0.502 lr=5.461e-05 step/s=9.52
+[INFO] 2026-01-30 23:42:09,723 - [VAL] thr=0.965 trades=1418 avg_rnet=0.009636 winrate=0.549
+[INFO] 2026-01-30 23:42:09,723 - [VAL] thr=0.965 trades=1418 avg_rnet=0.009636 winrate=0.549
+[INFO] 2026-01-30 23:42:09,724 - E024 DONE train_loss=0.585400 val_bce=0.829216 val_acc@0.5=0.4998 n_val=1562057 epoch_time_s=337.8
+[INFO] 2026-01-30 23:42:09,724 - E024 DONE train_loss=0.585400 val_bce=0.829216 val_acc@0.5=0.4998 n_val=1562057 epoch_time_s=337.8
+[INFO] 2026-01-30 23:42:09,831 - E025 S00001/00016 loss=0.545745 ema=0.545745 y_mean=0.512 lr=5.416e-05 step/s=9.38
+[INFO] 2026-01-30 23:42:09,831 - E025 S00001/00016 loss=0.545745 ema=0.545745 y_mean=0.512 lr=5.416e-05 step/s=9.38
+[INFO] 2026-01-30 23:47:46,532 - [VAL] thr=0.978 trades=175 avg_rnet=0.013312 winrate=0.526
+[INFO] 2026-01-30 23:47:46,532 - [VAL] thr=0.978 trades=175 avg_rnet=0.013312 winrate=0.526
+[INFO] 2026-01-30 23:47:46,533 - E025 DONE train_loss=0.576687 val_bce=0.807256 val_acc@0.5=0.4994 n_val=1562057 epoch_time_s=336.8
+[INFO] 2026-01-30 23:47:46,533 - E025 DONE train_loss=0.576687 val_bce=0.807256 val_acc@0.5=0.4994 n_val=1562057 epoch_time_s=336.8
+[INFO] 2026-01-30 23:47:46,711 - E026 S00001/00016 loss=0.560772 ema=0.560772 y_mean=0.498 lr=5.369e-05 step/s=5.64
+[INFO] 2026-01-30 23:47:46,711 - E026 S00001/00016 loss=0.560772 ema=0.560772 y_mean=0.498 lr=5.369e-05 step/s=5.64
+[INFO] 2026-01-30 23:53:25,579 - [VAL] thr=0.959 trades=2718 avg_rnet=0.006467 winrate=0.509
+[INFO] 2026-01-30 23:53:25,579 - [VAL] thr=0.959 trades=2718 avg_rnet=0.006467 winrate=0.509
+[INFO] 2026-01-30 23:53:25,579 - E026 DONE train_loss=0.558624 val_bce=0.855128 val_acc@0.5=0.4986 n_val=1562057 epoch_time_s=339.0
+[INFO] 2026-01-30 23:53:25,579 - E026 DONE train_loss=0.558624 val_bce=0.855128 val_acc@0.5=0.4986 n_val=1562057 epoch_time_s=339.0
+[INFO] 2026-01-30 23:53:25,642 - E027 S00001/00016 loss=0.524737 ema=0.524737 y_mean=0.492 lr=5.320e-05 step/s=16.21
+[INFO] 2026-01-30 23:53:25,642 - E027 S00001/00016 loss=0.524737 ema=0.524737 y_mean=0.492 lr=5.320e-05 step/s=16.21
+[INFO] 2026-01-30 23:59:05,599 - [VAL] thr=0.965 trades=2757 avg_rnet=0.004256 winrate=0.505
+[INFO] 2026-01-30 23:59:05,599 - [VAL] thr=0.965 trades=2757 avg_rnet=0.004256 winrate=0.505
+[INFO] 2026-01-30 23:59:05,600 - E027 DONE train_loss=0.534335 val_bce=0.828162 val_acc@0.5=0.5044 n_val=1562057 epoch_time_s=340.0
+[INFO] 2026-01-30 23:59:05,600 - E027 DONE train_loss=0.534335 val_bce=0.828162 val_acc@0.5=0.5044 n_val=1562057 epoch_time_s=340.0
+[INFO] 2026-01-30 23:59:05,663 - E028 S00001/00016 loss=0.517301 ema=0.517301 y_mean=0.504 lr=5.270e-05 step/s=15.92
+[INFO] 2026-01-30 23:59:05,663 - E028 S00001/00016 loss=0.517301 ema=0.517301 y_mean=0.504 lr=5.270e-05 step/s=15.92
+[INFO] 2026-01-31 00:04:45,706 - [VAL] thr=0.990 trades=342 avg_rnet=0.019955 winrate=0.491
+[INFO] 2026-01-31 00:04:45,706 - [VAL] thr=0.990 trades=342 avg_rnet=0.019955 winrate=0.491
+[INFO] 2026-01-31 00:04:45,706 - E028 DONE train_loss=0.514763 val_bce=0.928341 val_acc@0.5=0.5025 n_val=1562057 epoch_time_s=340.1
+[INFO] 2026-01-31 00:04:45,706 - E028 DONE train_loss=0.514763 val_bce=0.928341 val_acc@0.5=0.5025 n_val=1562057 epoch_time_s=340.1
+[INFO] 2026-01-31 00:04:45,769 - E029 S00001/00016 loss=0.468245 ema=0.468245 y_mean=0.438 lr=5.218e-05 step/s=16.10
+[INFO] 2026-01-31 00:04:45,769 - E029 S00001/00016 loss=0.468245 ema=0.468245 y_mean=0.438 lr=5.218e-05 step/s=16.10
+[INFO] 2026-01-31 00:10:25,139 - [VAL] thr=0.972 trades=3531 avg_rnet=0.004232 winrate=0.510
+[INFO] 2026-01-31 00:10:25,139 - [VAL] thr=0.972 trades=3531 avg_rnet=0.004232 winrate=0.510
+[INFO] 2026-01-31 00:10:25,140 - E029 DONE train_loss=0.506246 val_bce=0.884353 val_acc@0.5=0.5042 n_val=1562057 epoch_time_s=339.4
+[INFO] 2026-01-31 00:10:25,140 - E029 DONE train_loss=0.506246 val_bce=0.884353 val_acc@0.5=0.5042 n_val=1562057 epoch_time_s=339.4
+[INFO] 2026-01-31 00:10:25,311 - E030 S00001/00016 loss=0.471336 ema=0.471336 y_mean=0.531 lr=5.165e-05 step/s=5.87
+[INFO] 2026-01-31 00:10:25,311 - E030 S00001/00016 loss=0.471336 ema=0.471336 y_mean=0.531 lr=5.165e-05 step/s=5.87
+[INFO] 2026-01-31 00:16:01,927 - [VAL] thr=0.990 trades=5671 avg_rnet=0.001495 winrate=0.489
+[INFO] 2026-01-31 00:16:01,927 - [VAL] thr=0.990 trades=5671 avg_rnet=0.001495 winrate=0.489
+[INFO] 2026-01-31 00:16:01,927 - E030 DONE train_loss=0.489148 val_bce=1.058357 val_acc@0.5=0.5009 n_val=1562057 epoch_time_s=336.8
+[INFO] 2026-01-31 00:16:01,927 - E030 DONE train_loss=0.489148 val_bce=1.058357 val_acc@0.5=0.5009 n_val=1562057 epoch_time_s=336.8
+[INFO] 2026-01-31 00:16:01,927 - [EARLY STOP] epoch=30 no_improve=30 best_val_avg_rnet=0.032336
+[INFO] 2026-01-31 00:16:01,927 - [EARLY STOP] epoch=30 no_improve=30 best_val_avg_rnet=0.032336
+[INFO] best model saved: /tmp/pycharm_project_889/runs_full_trial12_seed20263121/best_model.pt (best_val_avg_rnet=0.032336)
+[INFO] 2026-01-31 00:19:41,731 - [VAL] chosen threshold: thr=0.923 | trades=117 | winrate=0.615 | avg_rnet=0.032336
+[INFO] 2026-01-31 00:19:41,731 - [VAL] chosen threshold: thr=0.923 | trades=117 | winrate=0.615 | avg_rnet=0.032336
+[TEST] bce=0.7547 acc@0.5=0.4948 n_test=1567399
+[TEST] trading@thr=0.923 | trades=289 | winrate=0.554
+[DONE]
+[2026-01-31T00:25:23] END rc=0

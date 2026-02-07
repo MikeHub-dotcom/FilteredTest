@@ -621,6 +621,310 @@ def choose_thr_enter(
     raise ValueError(f"unknown thr_policy: {policy}")
 
 
+
+# -----------------------------
+# Full test-period backtest helpers
+# -----------------------------
+def _unpack_time_splits(T: int, train_frac: float, val_frac: float) -> Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]]:
+    """
+    Return ((tr_s,tr_e),(va_s,va_e),(te_s,te_e)) in inclusive indices.
+
+    Supports both signatures:
+      - new: time_split_indices(T, train_frac, val_frac) -> (train_end_excl, val_end_excl)
+      - old: time_split_indices(...) -> ((tr_s,tr_e),(va_s,va_e),(te_s,te_e))
+    """
+    out = train_mod.time_split_indices(T, train_frac, val_frac)
+    if isinstance(out, tuple) and len(out) == 2 and all(isinstance(x, int) for x in out):
+        train_end_excl, val_end_excl = int(out[0]), int(out[1])
+        tr_s, tr_e = 0, train_end_excl - 1
+        va_s, va_e = train_end_excl, val_end_excl - 1
+        te_s, te_e = val_end_excl, T - 1
+        return (tr_s, tr_e), (va_s, va_e), (te_s, te_e)
+
+    if isinstance(out, tuple) and len(out) == 3 and all(isinstance(x, tuple) and len(x) == 2 for x in out):
+        (tr_s, tr_e), (va_s, va_e), (te_s, te_e) = out  # type: ignore[misc]
+        return (int(tr_s), int(tr_e)), (int(va_s), int(va_e)), (int(te_s), int(te_e))
+
+    raise RuntimeError(f"Unexpected return from train_mod.time_split_indices: {out!r}")
+
+
+def _save_trade_plot(
+    *,
+    out_png: str,
+    close: np.ndarray,
+    buys: List[int],
+    sells: List[int],
+    spans: List[Tuple[int, int, float]],
+    title: str,
+) -> None:
+    x = np.arange(int(close.shape[0]), dtype=np.int32)
+    plt.figure(figsize=(12, 5))
+    plt.plot(x, close, linewidth=1.2)
+
+    # shaded holding periods + PnL labels
+    for b, s, pnl in spans:
+        if b < 0 or s < 0 or b >= len(close) or s >= len(close) or s <= b:
+            continue
+        color = "green" if pnl > 0 else "red"
+        plt.axvspan(b, s, alpha=0.12, color=color)
+        mid = (b + s) // 2
+        y = float(close[mid]) if float(close[mid]) > 0 else float(np.nanmax(close))
+        plt.text(mid, y, f"{pnl*100:.1f}%", fontsize=9, ha="center", va="bottom")
+
+    if buys:
+        plt.scatter(buys, close[buys], marker="^")
+    if sells:
+        plt.scatter(sells, close[sells], marker="v")
+
+    plt.title(title)
+    plt.xlabel("t (test window)")
+    plt.ylabel("Close")
+    plt.tight_layout()
+    Path(out_png).parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_png, dpi=140)
+    plt.close()
+
+
+def simulate_long_flat(
+    *,
+    close: np.ndarray,
+    probs: np.ndarray,
+    thr_enter: np.ndarray,
+    hysteresis: float,
+    exec_delay_days: int,
+    initial_cash: float,
+    trade_fee_eur_roundtrip: float,
+) -> Dict[str, object]:
+    """
+    Per-asset long/flat simulation (vectorized thresholds over time):
+      - Decision at t uses probs[t] and thr_enter[t]
+      - Exit threshold at t is max(0, thr_enter[t] - hysteresis)
+      - Execute at t+delay using close[t+delay]
+      - Full notional (all cash) per asset, independent simulation
+    """
+    close = np.asarray(close, dtype=np.float64)
+    probs = np.asarray(probs, dtype=np.float32)
+    thr_enter = np.asarray(thr_enter, dtype=np.float32)
+    n = int(close.shape[0])
+    if thr_enter.shape[0] != probs.shape[0]:
+        raise ValueError(f"thr_enter/probs length mismatch: {thr_enter.shape[0]} vs {probs.shape[0]}")
+
+    delay = int(max(0, exec_delay_days))
+    cash = float(initial_cash)
+    shares = 0.0
+    in_pos = False
+    entry_idx: Optional[int] = None
+    entry_price: Optional[float] = None
+
+    equity = np.full((n,), np.nan, dtype=np.float64)
+    buys: List[int] = []
+    sells: List[int] = []
+    spans: List[Tuple[int, int, float]] = []
+
+    # decisions only defined on [0..len(probs)-1]
+    for t in range(n):
+        px = float(close[t])
+        equity[t] = cash + (shares * px if px > 0 else 0.0)
+        if t >= probs.shape[0]:
+            continue
+
+        thr = float(thr_enter[t])
+        thr_exit = max(0.0, thr - float(hysteresis))
+        p = float(probs[t])
+
+        want_long = (p >= thr) if (not in_pos) else (p >= thr_exit)
+        te = t + delay
+        if te >= n:
+            continue
+        ex_price = float(close[te])
+        if ex_price <= 0:
+            continue
+
+        if (not in_pos) and want_long:
+            if cash > 0:
+                shares = cash / ex_price
+                cash = 0.0
+                in_pos = True
+                entry_idx = int(te)
+                entry_price = float(ex_price)
+                buys.append(int(te))
+        elif in_pos and (not want_long):
+            proceeds = shares * ex_price
+            shares = 0.0
+            cash = max(0.0, proceeds - float(trade_fee_eur_roundtrip))
+            in_pos = False
+            sells.append(int(te))
+            if entry_idx is not None and entry_price is not None and entry_price > 0:
+                pnl_frac = (ex_price / entry_price) - 1.0
+                spans.append((int(entry_idx), int(te), float(pnl_frac)))
+            entry_idx, entry_price = None, None
+
+    # force close at end
+    if in_pos and shares > 0 and float(close[-1]) > 0:
+        ex_price = float(close[-1])
+        proceeds = shares * ex_price
+        shares = 0.0
+        cash = max(0.0, proceeds - float(trade_fee_eur_roundtrip))
+        sells.append(n - 1)
+        if entry_idx is not None and entry_price is not None and entry_price > 0:
+            pnl_frac = (ex_price / entry_price) - 1.0
+            spans.append((int(entry_idx), int(n - 1), float(pnl_frac)))
+
+    final_equity = float(cash)
+    total_return = (final_equity / float(initial_cash)) - 1.0 if initial_cash > 0 else float("nan")
+    n_trades = int(min(len(buys), len(sells)))
+    wins = sum(1 for _, _, pf in spans if pf > 0)
+    winrate = (wins / n_trades) if n_trades > 0 else float("nan")
+
+    return {
+        "equity": equity,
+        "buys": buys,
+        "sells": sells,
+        "spans": spans,
+        "final_equity": final_equity,
+        "total_return": float(total_return),
+        "n_trades": n_trades,
+        "winrate": float(winrate),
+    }
+
+
+
+# -----------------------------
+# Full-test backtest (optional)
+# -----------------------------
+def _find_close_idx(feat_names: List[str]) -> int:
+    for i, n in enumerate(feat_names):
+        if str(n).strip().lower() == "close":
+            return int(i)
+    raise RuntimeError("Could not find 'Close' feature in features list/json.")
+
+
+def run_backtest_full_test(
+    *,
+    X_raw: np.ndarray,
+    Xn: np.ndarray,
+    M: np.ndarray,
+    assets: List[str],
+    dates: List[str],
+    feat_names: List[str],
+    models: List[torch.nn.Module],
+    ckpt_thrs: List[Optional[float]],
+    lookback: int,
+    args: argparse.Namespace,
+    device: torch.device,
+    outdir: str,
+) -> None:
+    """Run a simple per-asset long/flat backtest across the full test split.
+
+    - Decisions are made daily in the test window using ensemble probabilities.
+    - Entry threshold is computed daily using the configured thr_policy over cross-sectional probs.
+    - Each asset is simulated independently using `simulate_long_flat`.
+    """
+    out = Path(outdir)
+    out.mkdir(parents=True, exist_ok=True)
+    plots_dir = out / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+
+    close_idx = _find_close_idx(feat_names)
+    close_raw = X_raw[:, :, close_idx].astype(np.float64, copy=False)
+    close_m = M[:, :, close_idx].astype(bool, copy=False)
+
+    (_tr_s, _tr_e), (_va_s, _va_e), (te_s, te_e) = _unpack_time_splits(
+        T=int(len(dates)),
+        train_frac=float(args.train_frac),
+        val_frac=float(args.val_frac),
+    )
+
+    delay = int(max(0, args.bt_exec_delay_days))
+    last_decision_t = int(te_e - delay)
+    if last_decision_t < te_s:
+        raise RuntimeError(f"Test window too small for exec_delay_days={delay}: te_s={te_s} te_e={te_e}")
+
+    decision_ts = list(range(int(te_s), int(last_decision_t) + 1))
+    thr_series = np.full((len(decision_ts),), np.nan, dtype=np.float32)
+    probs_cube = np.full((len(decision_ts), len(assets)), np.nan, dtype=np.float32)
+
+    ensemble_weights = [float(x) for x in str(args.ensemble_weights).split(",") if x.strip()] if str(args.ensemble_weights).strip() else None
+
+    for k, t in enumerate(decision_ts):
+        probs = infer_probs_for_date(
+            models=models,
+            Xn=Xn,
+            M=M,
+            t_idx=int(t),
+            lookback=int(lookback),
+            batch_assets=int(args.batch_assets),
+            device=device,
+            amp=not bool(args.no_amp),
+            ensemble_mode=str(args.ensemble_mode),
+            ensemble_weights=ensemble_weights,
+        )
+        probs_cube[k] = probs.astype(np.float32, copy=False)
+
+        thr_series[k] = float(
+            choose_thr_enter(
+                probs,
+                policy=str(args.thr_policy),
+                fixed_thr=args.thr_enter,
+                ckpt_thrs=ckpt_thrs,
+                quantile_q=float(args.thr_quantile),
+            )
+        )
+
+    per_asset: List[Dict[str, object]] = []
+    for ai, sym in enumerate(assets):
+        cm = close_m[ai, te_s:te_e + 1]
+        if int(cm.sum()) < int(args.bt_min_obs):
+            continue
+
+        close = close_raw[ai, te_s:te_e + 1].copy()
+        close[~cm] = np.nan
+
+        p_series = probs_cube[:, ai]
+        sim = simulate_long_flat(
+            close=np.nan_to_num(close, nan=0.0),
+            probs=p_series,
+            thr_enter=thr_series,
+            hysteresis=float(args.bt_hysteresis),
+            exec_delay_days=int(args.bt_exec_delay_days),
+            initial_cash=float(args.bt_initial_cash),
+            trade_fee_eur_roundtrip=float(args.bt_fee_eur_roundtrip),
+        )
+
+        per_asset.append(
+            {
+                "asset": sym,
+                "test_start": dates[te_s],
+                "test_end": dates[te_e],
+                "n_trades": int(sim["n_trades"]),
+                "total_return": float(sim["total_return"]),
+                "winrate": float(sim["winrate"]),
+                "final_equity": float(sim["final_equity"]),
+            }
+        )
+
+        if sim["spans"]:
+            _save_trade_plot(
+                out_png=str(plots_dir / f"{sym}.png"),
+                close=np.nan_to_num(close, nan=0.0),
+                buys=sim["buys"],
+                sells=sim["sells"],
+                spans=sim["spans"],
+                title=f"{sym} (test {dates[te_s]}..{dates[te_e]})",
+            )
+
+    rets = np.array([d["total_return"] for d in per_asset], dtype=np.float64) if per_asset else np.array([], dtype=np.float64)
+    summary = {
+        "test_start": dates[te_s],
+        "test_end": dates[te_e],
+        "n_assets_reported": int(len(per_asset)),
+        "mean_total_return_pct": float(np.nanmean(rets) * 100.0) if rets.size else float("nan"),
+        "median_total_return_pct": float(np.nanmedian(rets) * 100.0) if rets.size else float("nan"),
+    }
+    save_json(str(out / "summary.json"), summary)
+    save_json(str(out / "per_asset.json"), {"assets": per_asset})
+
+
 # -----------------------------
 # Portfolio state (simple)
 # -----------------------------
@@ -684,6 +988,24 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--positions", default="positions.json", help="JSON state file to read.")
     p.add_argument("--outdir", default="runs_inference_ensemble")
+
+
+    # -----------------------------
+    # Optional: full-test backtest + per-asset plots
+    # -----------------------------
+    p.add_argument("--backtest_full_test", action="store_true",
+                   help="Run a realistic full test-period backtest (portfolio simulation) and write plots.")
+    p.add_argument("--backtest_dir", default="",
+                   help="Output directory for backtest artifacts. Default: <outdir>/backtest_full_test")
+    p.add_argument("--bt_initial_cash", type=float, default=10_000.0,
+                   help="Initial cash for portfolio simulation (EUR, arbitrary units).")
+    p.add_argument("--bt_fee_eur_roundtrip", type=float, default=1.0,
+                   help="Fixed roundtrip fee per completed trade (applied on exit).")
+    p.add_argument("--bt_exec_delay_days", type=int, default=1,
+                   help="Execution delay in days: signal at t, execute at t+delay using Close. 0=same day.")
+    p.add_argument("--bt_min_close_obs", type=int, default=50,
+                   help="Skip per-asset plot/report if fewer observed Close points in test window.")
+
     p.add_argument("--write_positions", action="store_true",
                    help="If set, overwrite --positions with updated state.")
 
@@ -691,6 +1013,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", default=None, help="cuda or cpu; default: cuda if available")
     p.add_argument("--batch_assets", type=int, default=512)
     p.add_argument("--no_amp", action="store_true")
+
+    p.add_argument("--bt_trade_fee_eur", type=float, default=1.0)
+    p.add_argument("--bt_hysteresis", type=float, default=0.02)
+    p.add_argument("--bt_min_obs", type=int, default=50,
+                   help="Skip assets with fewer observed Close points than this in test window.")
 
     return p.parse_args()
 
@@ -773,6 +1100,8 @@ def main() -> None:
     mu, sig = train_mod.masked_mean_std(X[:, train_slice, :], M[:, train_slice, :])
     Xn = train_mod.apply_masked_standardize(X, M, mu, sig)
 
+
+
     # checkpoints
     model_list = args.models or args.model
     if model_list is None:
@@ -847,18 +1176,14 @@ def main() -> None:
         else:
             # 2) For transformers: infer from checkpoint if possible (PatchTST/iTransformer),
             #    otherwise default to F.
+            sd = ckpt["model_state"]
             inferred = _infer_in_ch_from_ckpt(sd, cfg, model_type=model_type, F=F)
             in_ch = int(inferred) if inferred is not None else int(F)
 
+        # state dict
         sd = ckpt["model_state"]
-
         # ---- Legacy TCN detection (old training commit) ----
-        def _looks_like_legacy_tcn(sd):
-            has_head = any(k.startswith("head.") for k in sd.keys())
-            has_pre_or_out = any(k.startswith("pre.") or k.startswith("out.") for k in sd.keys())
-            return has_head and not has_pre_or_out
-
-        if ("tcn" in model_type) and _looks_like_legacy_tcn(sd):
+        if ("tcn" in model_type) and _ckpt_looks_like_legacy_tcn(sd):
             mdl = LegacyTCNModel(
                 in_ch=in_ch,
                 channels=int(getattr(cfg, "tcn_channels", 192)),
@@ -890,6 +1215,31 @@ def main() -> None:
             lookbacks.append(int(lb))
     lookback = max(lookbacks) if lookbacks else 192
     logger.info(f"ensemble lookback={lookback}")
+
+
+    # Optional: full test-period backtest (writes summary + per-asset plots)
+    if getattr(args, "backtest_full_test", False):
+        bt_dir = str(getattr(args, "backtest_dir", "")).strip()
+        if not bt_dir:
+            bt_dir = str(Path(args.outdir) / "backtest_full_test")
+        logger.info(f"[BACKTEST] running full-test backtest -> {bt_dir}")
+        run_backtest_full_test(
+            X_raw=X,
+            Xn=Xn,
+            M=M,
+            assets=assets,
+            dates=dates,
+            feat_names=features,
+            models=models,
+            ckpt_thrs=ckpt_thrs,
+            lookback=lookback,
+            args=args,
+            device=device,
+            outdir=bt_dir,
+        )
+        logger.info("[BACKTEST] done")
+        return
+
 
     # Inference
     probs = infer_probs_for_date(
